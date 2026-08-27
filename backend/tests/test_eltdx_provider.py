@@ -250,6 +250,7 @@ def test_bridge_bars_all_accepts_date_since(monkeypatch):
             return {"bars": [{"time": "2026-01-06T15:00:00+08:00"}], "request_count": 1}
 
     monkeypatch.setattr(ep.bridge, "get_client", lambda: type("C", (), {"bars": FakeBars()})())
+    monkeypatch.setattr(ep.bridge, "_to_jsonable", lambda obj: obj)
     out = ep.bridge.bars_all("sz000001", "day", since=dt.date(2026, 1, 6))
     assert out[0]["time"] == "2026-01-06T15:00:00+08:00"
 

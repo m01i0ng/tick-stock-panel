@@ -1071,6 +1071,157 @@ export interface MiningRequestV1 {
   beam_width?: number
   max_finalists?: number
   force?: boolean
+  research_context?: MiningResearchContext | null
+}
+
+export interface MiningResearchContext {
+  source: 'ai_assistant'
+  goal: string
+  title: string
+  hypothesis: string
+  rationale: string
+  expected_outcome: string
+  risks: string[]
+  ai_provider: string
+  ai_model: string
+}
+
+export interface MiningAssistantReportResponse {
+  run_id: string
+  report: string
+  ai_provider: string
+  ai_model: string
+}
+
+// ===== Catalog autoresearch sessions =====
+export type AutoresearchSessionStatus =
+  | 'awaiting_approval'
+  | 'running'
+  | 'paused'
+  | 'stopping'
+  | 'stopped'
+  | 'completed'
+  | 'failed'
+  | 'interrupted'
+
+export type AutoresearchTrialStatus =
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'stopped'
+
+export interface AutoresearchProposal {
+  title: string
+  hypothesis: string
+  rationale: string
+  factor_names: string[]
+  strategy_ids: string[]
+  expected_outcome: string
+  risks: string[]
+  digest: string
+}
+
+export interface AutoresearchTrialEvidence {
+  oos_sharpe?: number | null
+  oos_max_drawdown?: number | null
+  oos_positive_fold_ratio?: number | null
+  oos_n_trades?: number | null
+  qualified?: boolean | null
+  gate_reasons?: string[]
+  valid_folds?: number
+  factor_names?: string[] | null
+  benchmark_sharpe?: number | null
+  max_abs_correlation?: number | null
+  max_corr_pair?: string[] | null
+  regime_sharpe?: Record<string, number> | null
+}
+
+export type AutoresearchHoldoutStatus = 'reserved' | 'sealing' | 'sealed' | 'failed'
+
+export interface AutoresearchHoldout {
+  status: AutoresearchHoldoutStatus
+  start: string | null
+  end: string | null
+  bars: number | null
+  mining_run_id?: string | null
+  signature?: string | null
+  sealed_at?: string | null
+  sharpe?: number | null
+  max_drawdown?: number | null
+  n_trades?: number | null
+  total_return?: number | null
+  qualified?: boolean | null
+  gate_reasons?: string[] | null
+  error?: string | null
+}
+
+export interface AutoresearchTrial {
+  index: number
+  proposal: AutoresearchProposal
+  mining_run_id: string | null
+  status: AutoresearchTrialStatus
+  started_at: string | null
+  finished_at: string | null
+  evidence?: AutoresearchTrialEvidence | null
+  improved?: boolean | null
+  error?: string | null
+}
+
+export interface AutoresearchLeaderboardRow {
+  trial_index: number
+  mining_run_id: string
+  proposal_digest: string
+  title: string
+  oos_sharpe: number | null
+  oos_max_drawdown: number | null
+  oos_positive_fold_ratio: number | null
+  oos_n_trades: number | null
+  qualified: boolean
+}
+
+export interface AutoresearchSessionCreate {
+  goal: string
+  asset_type: 'stock' | 'etf'
+  start?: string | null
+  end?: string | null
+  budget_profile: MiningBudgetProfile
+  commission_pct: number
+  stamp_tax_pct: number
+  slippage_bps: number
+  max_trials: number
+  max_wall_minutes: number
+  patience: number
+}
+
+export interface AutoresearchSession {
+  session_id: string
+  status: AutoresearchSessionStatus
+  goal: string
+  asset_type: 'stock' | 'etf'
+  start: string | null
+  end: string | null
+  adaptive_end?: string | null
+  holdout?: AutoresearchHoldout | null
+  budget_profile: MiningBudgetProfile
+  max_trials: number
+  max_wall_minutes: number
+  patience: number
+  created_at: string
+  updated_at: string
+  started_at: string | null
+  finished_at: string | null
+  approved_at: string | null
+  current_trial: number | null
+  active_run_id: string | null
+  completed_trials: number
+  no_improvement_trials: number
+  best_score?: number | null
+  data_snapshot_digest?: string | null
+  stop_reason: string | null
+  error: string | null
+  initial_proposal: AutoresearchProposal | null
+  trials: AutoresearchTrial[]
+  leaderboard: AutoresearchLeaderboardRow[]
 }
 
 export interface MiningRunProgress {
@@ -1177,6 +1328,8 @@ export interface MiningCandidateRow {
   promoted_candidate_id?: string | null
   published_strategy_id?: string | null
   gate?: MiningCandidateGate | null
+  publishable?: boolean
+  publish_block_reason?: string | null
   folds?: MiningFoldRow[]
 }
 
@@ -2307,6 +2460,42 @@ export const api = {
     request<MiningRun>('/api/backtest/mining/runs', {
       method: 'POST',
       body: JSON.stringify(payload),
+    }),
+
+  miningAssistantReport: (runId: string) =>
+    request<MiningAssistantReportResponse>('/api/backtest/mining/assistant/report', {
+      method: 'POST',
+      body: JSON.stringify({ run_id: runId }),
+    }),
+
+  autoresearchSessions: () =>
+    request<{ items: AutoresearchSession[] }>('/api/backtest/autoresearch/sessions'),
+
+  autoresearchSession: (sessionId: string) =>
+    request<AutoresearchSession>(`/api/backtest/autoresearch/sessions/${encodeURIComponent(sessionId)}`),
+
+  autoresearchCreate: (payload: AutoresearchSessionCreate) =>
+    request<AutoresearchSession>('/api/backtest/autoresearch/sessions', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  autoresearchApprove: (sessionId: string) =>
+    request<AutoresearchSession>(`/api/backtest/autoresearch/sessions/${encodeURIComponent(sessionId)}/approve`, { method: 'POST' }),
+
+  autoresearchPause: (sessionId: string) =>
+    request<AutoresearchSession>(`/api/backtest/autoresearch/sessions/${encodeURIComponent(sessionId)}/pause`, { method: 'POST' }),
+
+  autoresearchResume: (sessionId: string) =>
+    request<AutoresearchSession>(`/api/backtest/autoresearch/sessions/${encodeURIComponent(sessionId)}/resume`, { method: 'POST' }),
+
+  autoresearchStop: (sessionId: string) =>
+    request<AutoresearchSession>(`/api/backtest/autoresearch/sessions/${encodeURIComponent(sessionId)}/stop`, { method: 'POST' }),
+
+  autoresearchSeal: (sessionId: string, body?: { trial_index?: number }) =>
+    request<AutoresearchSession>(`/api/backtest/autoresearch/sessions/${encodeURIComponent(sessionId)}/seal`, {
+      method: 'POST',
+      body: JSON.stringify(body ?? {}),
     }),
 
   miningResult: (runId: string) =>

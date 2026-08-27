@@ -112,6 +112,16 @@ run 级的“有效折”统计只描述因子赛道：它按每折被选中的�
 
 自动任务只生成 pending 结果，永远不会自动发布策略。
 
+## Catalog 实验编排
+
+AI 只提供 Catalog 实验编排，不是选股页的策略代码生成器。AI 只能从当前运行时的因子目录和兼容的 matrix-native 日线策略中选择，不能创建新因子、公式、策略 ID 或 Python 代码。资产类型、验证档位、交易成本和研究预算由结构化请求固定，每次 AI 输出都会重新经过白名单和严格 JSON 校验。`POST /api/backtest/mining/assistant/plan` 已停用（410），请改用 `/api/backtest/autoresearch/sessions`。
+
+手工挖掘和 Catalog 会话创建共用同一预检：先验证所选档位的 enriched 交易日与 outer fold 覆盖，再验证市场环境文件及正式范围内的 T-1 覆盖。Catalog 实验额外要求区间尾部还能放下该档位的最终留出集（`outer_test_bars`），并在预检通过前不会调用 AI。批准入口在数据或目录状态变化时保持 `awaiting_approval`，不会先转成运行态再异步失败。数据失败返回可操作错误，并通过 `X-Mining-Preflight-Code` 区分 `enriched_insufficient`、`regime_unavailable` 和 `regime_incomplete`；未知因子、非 matrix-native、非日线或资产不兼容策略仍由既有白名单和请求校验 fail-closed。
+
+Catalog 自动研究使用独立持久 session 串行编排多个真实 mining run。用户批准首个假设后，服务端按 `max_trials`、`max_wall_minutes` 和 `patience` 限制运行，将每轮的公开 compact evidence 交给 AI 提出下一个不同的白名单组合。后续轮必须只改一个轴（只改因子或只改对照策略；改因子时最多加或删 1 个），并在 rationale 中回应上一轮 `benchmark_sharpe`、`max_corr_pair`、`regime_sharpe`。组合 digest 忽略列表顺序，防止通过换序重复消耗实验；研究数据快照在首个 trial 冻结，期间数据或实现变化会 fail-closed。暂停只阻止调度下一个 trial，停止和墙钟超时会取消 session 自己拥有的 leaf run。
+
+当前 outer 样本外证据会被自动循环反复读取，因此它属于 adaptive validation，不是密封的最终 holdout。Catalog 会话在创建时把用户指定区间的**最后 N 根交易日**留作最终留出集（N 为该档位 `outer_test_bars`：exploratory 63，balanced/strict 126），自适应挖掘的 `end` 停在留出集开始的前一个交易日。AI compact evidence 不含留出集日期或指标。会话终态后可一次性密封该留出集：`POST .../seal` 立即返回 `holdout.status=sealing`，后台评估冻结候选定义，不搜索、不重拟合；进程重启会把卡住的 `sealing` 标为 `failed`（`application_restarted`），可重试。密封通过后，发布门槛改用留出集 Sharpe / 回撤 / 交易数，不再使用自适应 fold 数；exploratory 即使密封仍只能 pending。未密封或留出集未通过时，服务端拒绝直接发布。AI 不参与候选排序、门槛计算或发布，也不会自动监控或交易。
+
 ## 保存与发布
 
 “保存候选”只从服务端已注册的 `candidates.parquet` 读取定义，并重新校验 artifact schema、canonical signature、原始请求中的因子/策略范围和当前策略兼容性，再写入研究候选库。客户端只能提交 run ID 与 candidate signature，不能在保存时重交权重、方向、公式或代码。保存按 `(origin_run_id, candidate_signature)` 幂等；如果候选库已写入但 artifact backlink 回写失败，重试只修复 backlink，不会创建重复候选。

@@ -15,6 +15,7 @@ from app.api.mining import router
 from app.backtest.mining import compute_candidate_signature
 from app.enriched_generation import EnrichedGenerationUnavailableError
 from app.services.mining_jobs import MiningRunStore
+from app.services.mining_preflight import MiningPreflightError, reserve_final_holdout
 from app.strategy.engine import StrategyEngine
 
 _FACTOR_DEFINITION = {
@@ -85,8 +86,19 @@ def _write_enriched_dates(
     return values
 
 
+def _write_regime_dates(data_dir: Path, values: list[date]) -> None:
+    path = data_dir / "regime_history" / "part.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({
+        "date": values,
+        "state": ["range"] * len(values),
+        "score": [50] * len(values),
+    }).write_parquet(path)
+
+
 def _client(tmp_path):
-    _write_enriched_dates(tmp_path, 219, first=date(2022, 8, 15))
+    dates = _write_enriched_dates(tmp_path, 219, first=date(2022, 8, 15))
+    _write_regime_dates(tmp_path, dates)
     app = FastAPI()
     app.include_router(router)
     app.state.repo = _Repo(tmp_path)
@@ -95,7 +107,12 @@ def _client(tmp_path):
     return TestClient(app), app.state.mining_manager.store
 
 
-def _successful_run(store: MiningRunStore, run_id: str = "result-run"):
+def _successful_run(
+    store: MiningRunStore,
+    run_id: str = "result-run",
+    *,
+    fingerprint: dict | None = None,
+):
     manifest = store.create(
         {
             "factor_names": ["turnover_rate"],
@@ -104,7 +121,7 @@ def _successful_run(store: MiningRunStore, run_id: str = "result-run"):
             "budget_profile": "exploratory",
             "correlation_threshold": 0.75,
         },
-        {"generation": "test"},
+        fingerprint or {"generation": "test"},
         run_id=run_id,
     )
     store.append_event(run_id, "queued", {"status": "queued", "source": "manual"})
@@ -335,6 +352,44 @@ def test_start_rejects_balanced_625_bar_range_before_creating_run(tmp_path):
     assert store.list_runs() == []
 
 
+def test_start_rejects_missing_regime_before_creating_run(tmp_path):
+    client, store = _client(tmp_path)
+    (tmp_path / "regime_history" / "part.parquet").unlink()
+
+    response = client.post(
+        "/api/backtest/mining/runs",
+        json={
+            "factor_names": ["turnover_rate"],
+            "budget_profile": "exploratory",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "市场环境" in response.json()["detail"]
+    assert response.headers["X-Mining-Preflight-Code"] == "regime_unavailable"
+    assert store.list_runs() == []
+
+
+def test_start_rejects_incomplete_regime_before_creating_run(tmp_path):
+    client, store = _client(tmp_path)
+    path = tmp_path / "regime_history" / "part.parquet"
+    history = pl.read_parquet(path).sort("date")
+    history.filter(pl.col("date") != history["date"][0]).write_parquet(path)
+
+    response = client.post(
+        "/api/backtest/mining/runs",
+        json={
+            "factor_names": ["turnover_rate"],
+            "budget_profile": "exploratory",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "T-1" in response.json()["detail"]
+    assert response.headers["X-Mining-Preflight-Code"] == "regime_incomplete"
+    assert store.list_runs() == []
+
+
 def test_availability_uses_asset_specific_valid_partitions(tmp_path):
     client, _store = _client(tmp_path)
     etf_dates = _write_enriched_dates(
@@ -394,6 +449,107 @@ def test_result_reconstructs_artifacts_without_exposing_definition(tmp_path):
     assert regimes["strong"]["n_dates"] == 2
     assert regimes["range"]["total_return"] is None
     assert body["telemetry"]["panel_scans"] == 1
+
+
+def test_autoresearch_result_exposes_final_holdout_publication_block(tmp_path):
+    client, store = _client(tmp_path)
+    _successful_run(
+        store,
+        run_id="autoresearch-result",
+        fingerprint={
+            "generation": "test",
+            "source": "autoresearch",
+            "source_session_id": "session-1",
+            "final_holdout_sealed": False,
+        },
+    )
+
+    candidate = client.get(
+        "/api/backtest/mining/runs/autoresearch-result/result"
+    ).json()["candidates"][0]
+
+    assert candidate["publishable"] is False
+    assert candidate["gate"]["qualified"] is False
+    assert "最终留出集" in candidate["publish_block_reason"]
+    assert "最终留出集" in candidate["gate"]["reasons"][-1]
+
+
+def test_autoresearch_result_exposes_failed_holdout_publication_block(tmp_path):
+    client, store = _client(tmp_path)
+    _successful_run(
+        store,
+        run_id="autoresearch-holdout-fail",
+        fingerprint={
+            "generation": "test",
+            "source": "autoresearch",
+            "source_session_id": "session-1",
+            "final_holdout_sealed": True,
+            "final_holdout": {
+                "signature": _FACTOR_SIGNATURE,
+                "sharpe": 0.1,
+                "max_drawdown": -0.1,
+                "n_trades": 80,
+            },
+        },
+    )
+    candidate = client.get(
+        "/api/backtest/mining/runs/autoresearch-holdout-fail/result"
+    ).json()["candidates"][0]
+    assert candidate["publishable"] is False
+    assert "未通过" in candidate["publish_block_reason"]
+    assert "holdout Sharpe" in candidate["gate"]["reasons"][0]
+
+
+def test_autoresearch_result_marks_sealed_holdout_publishable(tmp_path):
+    client, store = _client(tmp_path)
+    _successful_run(
+        store,
+        run_id="autoresearch-holdout-pass",
+        fingerprint={
+            "generation": "test",
+            "source": "autoresearch",
+            "source_session_id": "session-1",
+            "final_holdout_sealed": True,
+            "final_holdout": {
+                "signature": _FACTOR_SIGNATURE,
+                "sharpe": 0.9,
+                "max_drawdown": -0.1,
+                "n_trades": 80,
+            },
+        },
+    )
+    candidate = client.get(
+        "/api/backtest/mining/runs/autoresearch-holdout-pass/result"
+    ).json()["candidates"][0]
+    assert candidate["publishable"] is True
+    assert candidate["publish_block_reason"] is None
+
+
+def test_reserve_final_holdout_splits_adaptive_tail(tmp_path):
+    dates = _write_enriched_dates(tmp_path, 282, first=date(2020, 1, 1))
+    _write_regime_dates(tmp_path, dates)
+    reserved = reserve_final_holdout(
+        tmp_path,
+        asset_type="stock",
+        budget_profile="exploratory",
+    )
+    assert reserved["bars"] == 63
+    assert reserved["status"] == "reserved"
+    assert reserved["end"] == dates[-1].isoformat()
+    assert reserved["start"] == dates[-63].isoformat()
+    assert reserved["adaptive_end"] == dates[-64].isoformat()
+
+
+def test_reserve_final_holdout_requires_adaptive_plus_holdout_bars(tmp_path):
+    dates = _write_enriched_dates(tmp_path, 281, first=date(2020, 1, 1))
+    _write_regime_dates(tmp_path, dates)
+    with pytest.raises(MiningPreflightError, match="final holdout") as exc:
+        reserve_final_holdout(
+            tmp_path,
+            asset_type="stock",
+            budget_profile="exploratory",
+        )
+    assert exc.value.code == "enriched_insufficient"
 
 
 def test_result_marks_legacy_fold_rows_without_evaluation_kind(tmp_path):

@@ -20,7 +20,11 @@ import pyarrow.parquet as pq
 
 from app.backtest.candidates import CandidateStore
 from app.backtest.factor import FACTOR_COLUMNS
-from app.backtest.mining import compute_candidate_signature, evaluate_candidate_gate
+from app.backtest.mining import (
+    compute_candidate_signature,
+    evaluate_candidate_gate,
+    evaluate_holdout_gate,
+)
 from app.services.mining_jobs import SUCCESS_RUN_STATUSES, MiningRunStore
 from app.strategy.ai_generator import AIStrategyGenerator
 from app.strategy.engine import StrategyEngine
@@ -114,14 +118,8 @@ class MiningCandidateService:
             manifest, summary, path, frame, row, definition = self._load_candidate(
                 run_id, signature
             )
-            gate = evaluate_candidate_gate(
-                confidence=row.get("confidence"),
-                valid_folds=row.get("valid_folds"),
-                positive_fold_ratio=row.get("oos_positive_fold_ratio"),
-                sharpe=row.get("oos_sharpe"),
-                max_drawdown=row.get("oos_max_drawdown"),
-                n_trades=row.get("oos_n_trades"),
-            )
+            self._reject_unsealed_autoresearch_publication(manifest)
+            gate = self._publication_gate(manifest, row)
             if not gate.qualified:
                 raise ValueError(
                     "candidate does not meet the promotion gate: "
@@ -180,6 +178,48 @@ class MiningCandidateService:
                     published_id,
                 )
             return {"ok": True, "strategy_id": published_id}
+
+    @staticmethod
+    def _reject_unsealed_autoresearch_publication(manifest: Mapping[str, Any]) -> None:
+        fingerprint = manifest.get("data_fingerprint")
+        if (
+            isinstance(fingerprint, Mapping)
+            and fingerprint.get("source") == "autoresearch"
+            and fingerprint.get("final_holdout_sealed") is not True
+        ):
+            raise ValueError(
+                "autoresearch candidate publication requires sealed final holdout validation"
+            )
+
+    @staticmethod
+    def _publication_gate(manifest: Mapping[str, Any], row: Mapping[str, Any]):
+        fingerprint = manifest.get("data_fingerprint")
+        if (
+            isinstance(fingerprint, Mapping)
+            and fingerprint.get("source") == "autoresearch"
+            and fingerprint.get("final_holdout_sealed") is True
+        ):
+            holdout = fingerprint.get("final_holdout")
+            if not isinstance(holdout, Mapping):
+                raise ValueError("autoresearch candidate is missing sealed holdout evidence")
+            if holdout.get("signature") not in (None, row.get("signature")):
+                raise ValueError(
+                    "this candidate was not the sealed final holdout definition"
+                )
+            return evaluate_holdout_gate(
+                confidence=row.get("confidence"),
+                sharpe=holdout.get("sharpe"),
+                max_drawdown=holdout.get("max_drawdown"),
+                n_trades=holdout.get("n_trades"),
+            )
+        return evaluate_candidate_gate(
+            confidence=row.get("confidence"),
+            valid_folds=row.get("valid_folds"),
+            positive_fold_ratio=row.get("oos_positive_fold_ratio"),
+            sharpe=row.get("oos_sharpe"),
+            max_drawdown=row.get("oos_max_drawdown"),
+            n_trades=row.get("oos_n_trades"),
+        )
 
     def _load_candidate(
         self,

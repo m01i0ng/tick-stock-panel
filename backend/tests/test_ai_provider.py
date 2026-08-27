@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import os
+import sys
 import tomllib
 
 import httpx
@@ -360,6 +363,25 @@ async def test_generate_ai_text_default_cap_and_none_passthrough(monkeypatch):
     assert captured["max_tokens"] is None  # None = 推理模型放开, 不钳制
 
 
+@pytest.mark.asyncio
+async def test_generate_ai_text_respects_explicit_codex_timeout(monkeypatch):
+    captured: dict = {}
+    monkeypatch.setattr(ai_provider, "is_codex_cli_provider", lambda: True)
+    monkeypatch.setattr(ai_provider, "current_ai_max_output_tokens", lambda: 4000)
+    monkeypatch.setattr(ai_provider, "current_ai_context_window", lambda: 64000)
+
+    async def fake_run(messages, *, max_tokens, timeout):
+        captured["timeout"] = timeout
+        return "ok"
+
+    monkeypatch.setattr(ai_provider, "_run_codex_cli", fake_run)
+
+    assert await ai_provider.generate_ai_text(
+        [{"role": "user", "content": "hi"}], timeout=2.5
+    ) == "ok"
+    assert captured["timeout"] == 2.5
+
+
 def test_save_ai_settings_persists_token_sizes(monkeypatch):
     from app.api import settings as settings_api
     from app.config import settings as app_settings
@@ -389,8 +411,9 @@ def test_save_ai_settings_persists_token_sizes(monkeypatch):
 
 
 def test_save_ai_settings_rejects_non_positive(monkeypatch):
-    from app.api import settings as settings_api
     from fastapi import HTTPException
+
+    from app.api import settings as settings_api
 
     req = settings_api.AiSettingsIn(provider="openai_compat", max_output_tokens=-1)
     with pytest.raises(HTTPException):
@@ -543,14 +566,22 @@ async def test_codex_exec_args_exclude_ephemeral(monkeypatch):
     """exec 参数不含 --ephemeral: 老版本 codex(如 0.58)无此参数, 传了直接报错。"""
     captured: dict = {}
 
-    def fake_run_process(args, prompt, env, timeout):
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self, prompt):
+            captured["prompt"] = prompt
+            return b"ok", b""
+
+    async def fake_create_process(*args, **kwargs):
         captured["args"] = list(args)
-        return 0, b"ok", b""
+        captured["kwargs"] = kwargs
+        return FakeProcess()
 
     monkeypatch.setattr(ai_provider, "_codex_base_command", lambda: ["codex"])
     monkeypatch.setattr(ai_provider, "_prepare_codex_home", lambda p: None)
     monkeypatch.setattr(ai_provider, "_codex_process_env", lambda p: {})
-    monkeypatch.setattr(ai_provider, "_run_codex_process", fake_run_process)
+    monkeypatch.setattr(ai_provider.asyncio, "create_subprocess_exec", fake_create_process)
     monkeypatch.setattr(ai_provider, "_read_output_file", lambda p: "ok")
     monkeypatch.setattr(ai_provider, "_remove_tree_best_effort", lambda p: None)
     monkeypatch.setattr(ai_provider, "current_ai_model", lambda: "gpt-5.6-sol")
@@ -563,3 +594,48 @@ async def test_codex_exec_args_exclude_ephemeral(monkeypatch):
     assert "--ephemeral" not in args
     assert "exec" in args and "--skip-git-repo-check" in args
     assert args[args.index("--model") + 1] == "gpt-5.6-sol"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group cancellation check")
+async def test_codex_exec_cancellation_stops_process_group(tmp_path, monkeypatch):
+    stopped = tmp_path / "stopped"
+    started = tmp_path / "started"
+    script = tmp_path / "blocking_codex.py"
+    script.write_text(
+        "import pathlib, signal, sys, time\n"
+        "stopped, started = map(pathlib.Path, sys.argv[1:3])\n"
+        "def stop(*_):\n"
+        "    stopped.write_text('stopped')\n"
+        "    raise SystemExit\n"
+        "signal.signal(signal.SIGTERM, stop)\n"
+        "started.write_text('started')\n"
+        "while True: time.sleep(1)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        ai_provider,
+        "_codex_base_command",
+        lambda: [sys.executable, str(script), str(stopped), str(started)],
+    )
+    monkeypatch.setattr(ai_provider, "_prepare_codex_home", lambda path: None)
+    monkeypatch.setattr(ai_provider, "_codex_process_env", lambda path: os.environ.copy())
+    monkeypatch.setattr(ai_provider, "current_ai_model", lambda: "")
+
+    task = asyncio.create_task(
+        ai_provider._run_codex_cli(
+            [{"role": "user", "content": "hi"}],
+            max_tokens=None,
+            timeout=60.0,
+        )
+    )
+    for _ in range(100):
+        if started.exists():
+            break
+        await asyncio.sleep(0.01)
+    assert started.exists()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=3.0)
+    assert stopped.read_text(encoding="utf-8") == "stopped"

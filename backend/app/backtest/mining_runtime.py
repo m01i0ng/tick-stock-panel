@@ -1553,3 +1553,85 @@ def _budget_exhausted(result: MiningResult) -> bool:
     if result.trials_used >= result.request.budget.max_trials:
         return True
     return any("budget exhausted" in (fold.error or "") for fold in result.folds)
+
+
+def evaluate_frozen_candidate(
+    *,
+    repo: Any,
+    strategy_engine: StrategyEngine,
+    data_dir: Path,
+    definition: Mapping[str, Any],
+    asset_type: str,
+    start: date,
+    end: date,
+    commission_pct: float,
+    stamp_tax_pct: float,
+    slippage_bps: float,
+    expected_generation: str | None,
+    symbols: list[str] | None = None,
+) -> dict[str, Any]:
+    """Evaluate one frozen definition on a holdout window; never searches or refits."""
+    from app.backtest.engine import BacktestEngine
+
+    kind = str(definition.get("kind") or "")
+    factor_names = tuple(str(value) for value in definition.get("factor_names") or ())
+    strategy_ids: tuple[str, ...] = ()
+    if kind == "existing_strategy":
+        strategy_id = str(definition.get("strategy_id") or "")
+        if not strategy_id:
+            raise ValueError("existing strategy holdout definition is missing strategy_id")
+        strategy_ids = (strategy_id,)
+        if not factor_names:
+            factor_names = ("momentum_5d",)
+    elif kind != "factor_rank":
+        raise ValueError(f"unsupported holdout definition kind: {kind!r}")
+    elif not factor_names:
+        raise ValueError("factor holdout definition is missing factor_names")
+
+    request = RuntimeRequest(
+        run_id="holdout",
+        factor_names=factor_names,
+        strategy_ids=strategy_ids,
+        symbols=symbols,
+        asset_type=asset_type,  # type: ignore[arg-type]
+        start=start,
+        end=end,
+        profile="exploratory",
+        forward_horizon=5,
+        commission_pct=commission_pct,
+        stamp_tax_pct=stamp_tax_pct,
+        slippage_bps=slippage_bps,
+        correlation_threshold=0.75,
+        max_finalists=1,
+        require_regime=False,
+        mining_request=MiningRequest.for_profile("exploratory", factor_names),
+    )
+    service = StrategyBacktestService(BacktestEngine(repo), strategy_engine)
+    base_market = _prepare_base_market(
+        service,
+        strategy_engine,
+        data_dir,
+        request,
+        expected_generation=expected_generation,
+    )
+    evaluator = MatcherCandidateEvaluator(
+        service,
+        strategy_engine,
+        data_dir,
+        request,
+        base_market,
+        None,
+    )
+    labels = [
+        value.isoformat()
+        for value in enriched_partition_dates(data_dir, asset_type, start, end)
+    ]
+    evaluation = evaluator.evaluate_test(pl.DataFrame({"date": labels}), definition)
+    trades = evaluation.metrics.get("n_trades")
+    return {
+        "sharpe": _finite_or_none(evaluation.metrics.get("sharpe")),
+        "max_drawdown": _finite_or_none(evaluation.metrics.get("max_drawdown")),
+        "n_trades": int(trades) if isinstance(trades, (int, float)) and not isinstance(trades, bool) else None,
+        "total_return": _finite_or_none(evaluation.metrics.get("total_return")),
+        "error": evaluation.error,
+    }

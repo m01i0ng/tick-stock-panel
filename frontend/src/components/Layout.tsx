@@ -249,7 +249,7 @@ function TierBadge({ label, hasKey, providerName, isTickflow }: { label: string;
 }
 
 function AIConfigBadge({ configured, model }: { configured?: boolean; model?: string }) {
-  const descText = configured ? (model || '已接入模型') : '接入策略生成模型'
+  const descText = configured ? (model || '已接入模型') : '接入 AI 模型'
   return (
     <NavLink
       to="/settings?tab=ai"

@@ -16,6 +16,7 @@ from app.api import (
     abnormal,
     alerts,
     analysis,
+    autoresearch,
     backtest,
     data,
     ext_data,
@@ -238,6 +239,22 @@ async def _application_lifespan(app: FastAPI):
     app.state.strategy_engine = strategy_engine
     logger.info("strategy engine loaded: %d strategies", len(strategy_engine.list_strategies()))
 
+    from app.services.autoresearch_manager import ResearchSessionManager
+
+    autoresearch_manager = ResearchSessionManager(
+        store.data_dir,
+        mining_manager,
+        repo,
+        app.state,
+    )
+    recovered_research_sessions = autoresearch_manager.recover_interrupted()
+    app.state.autoresearch_manager = autoresearch_manager
+    if recovered_research_sessions:
+        logger.warning(
+            "recovered %d interrupted autoresearch sessions",
+            recovered_research_sessions,
+        )
+
     matrix_prewarm_owner = MatrixCachePrewarmOwner()
 
     def _schedule_matrix_cache_prewarm() -> None:
@@ -336,6 +353,9 @@ async def _application_lifespan(app: FastAPI):
         repo._on_refresh_done = None  # noqa: SLF001
         if not matrix_prewarm_owner.shutdown(timeout=5.0):
             logger.warning("matrix cache prewarm did not stop within 5 seconds")
+        research_manager = getattr(app.state, "autoresearch_manager", None)
+        if research_manager:
+            research_manager.shutdown()
         mmanager = getattr(app.state, "mining_manager", None)
         if mmanager:
             mmanager.shutdown()
@@ -442,6 +462,7 @@ app.include_router(watchlist.router)
 app.include_router(screener.router)
 app.include_router(backtest.router)
 app.include_router(mining.router)
+app.include_router(autoresearch.router)
 app.include_router(intraday.router)
 app.include_router(indices.router)
 app.include_router(overview.router)

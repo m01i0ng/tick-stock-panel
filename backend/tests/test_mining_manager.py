@@ -38,6 +38,23 @@ def _wait_for_status(
     pytest.fail(f"run {run_id} did not reach {status}")
 
 
+def _wait_for_event_types(
+    manager: MiningJobManager,
+    run_id: str,
+    expected: list[str],
+    *,
+    timeout: float = 2.0,
+) -> list[str]:
+    deadline = time.monotonic() + timeout
+    last: list[str] = []
+    while time.monotonic() < deadline:
+        last = [event["type"] for event in manager.store.read_events(run_id)]
+        if last == expected:
+            return last
+        time.sleep(0.005)
+    pytest.fail(f"run {run_id} events {last!r} did not become {expected!r}")
+
+
 @pytest.fixture
 def isolated_limiter(monkeypatch: pytest.MonkeyPatch) -> HeavyJobLimiter:
     limiter = HeavyJobLimiter(capacity=2, cancel_poll_interval=0.005)
@@ -122,12 +139,11 @@ def test_start_records_states_events_progress_and_worker_payload(
     assert terminal["started_at"] is not None
     assert terminal["finished_at"] is not None
     assert manager.store.read_summary(run_id) == result
-    assert [event["type"] for event in manager.store.read_events(run_id)] == [
-        "queued",
-        "running",
-        "progress",
-        "succeeded",
-    ]
+    _wait_for_event_types(
+        manager,
+        run_id,
+        ["queued", "running", "progress", "succeeded"],
+    )
 
 
 def test_start_accepts_valid_persistent_run_id(make_manager) -> None:
@@ -226,11 +242,11 @@ def test_cancel_while_waiting_for_capacity_never_calls_runner(
         assert cancelling["status"] == "cancelling"
         _wait_for_status(manager, run_id, "cancelled")
         assert not runner_called.is_set()
-        assert [event["type"] for event in manager.store.read_events(run_id)] == [
-            "queued",
-            "cancelling",
-            "cancelled",
-        ]
+        _wait_for_event_types(
+            manager,
+            run_id,
+            ["queued", "cancelling", "cancelled"],
+        )
     finally:
         isolated_limiter.release("mining")
 

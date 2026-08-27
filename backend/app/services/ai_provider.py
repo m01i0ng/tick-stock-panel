@@ -5,6 +5,7 @@ import asyncio
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -282,7 +283,7 @@ async def generate_ai_text(
     *,
     temperature: float | None = 0.3,
     max_tokens: int | None = 3000,
-    timeout: float = 180.0,
+    timeout: float | None = None,
 ) -> str:
     """Return a complete AI response from the currently configured provider.
 
@@ -294,12 +295,16 @@ async def generate_ai_text(
     max_tokens = _resolve_max_tokens(max_tokens)
     _check_input_budget(messages, max_tokens=max_tokens)
     if is_codex_cli_provider():
-        return await _run_codex_cli(messages, max_tokens=max_tokens, timeout=max(timeout, 600.0))
+        return await _run_codex_cli(
+            messages,
+            max_tokens=max_tokens,
+            timeout=600.0 if timeout is None else timeout,
+        )
     return await _run_openai_once(
         messages,
         temperature=temperature,
         max_tokens=max_tokens,
-        timeout=timeout,
+        timeout=180.0 if timeout is None else timeout,
     )
 
 
@@ -308,7 +313,7 @@ async def stream_ai_text(
     *,
     temperature: float | None = 0.5,
     max_tokens: int | None = 4000,
-    timeout: float = 180.0,
+    timeout: float | None = None,
 ) -> AsyncIterator[str]:
     """Yield text deltas from the configured provider.
 
@@ -320,14 +325,18 @@ async def stream_ai_text(
     max_tokens = _resolve_max_tokens(max_tokens)
     _check_input_budget(messages, max_tokens=max_tokens)
     if is_codex_cli_provider():
-        yield await _run_codex_cli(messages, max_tokens=max_tokens, timeout=max(timeout, 600.0))
+        yield await _run_codex_cli(
+            messages,
+            max_tokens=max_tokens,
+            timeout=600.0 if timeout is None else timeout,
+        )
         return
 
     async for chunk in _stream_openai(
         messages,
         temperature=temperature,
         max_tokens=max_tokens,
-        timeout=timeout,
+        timeout=180.0 if timeout is None else timeout,
     ):
         yield chunk
 
@@ -623,19 +632,33 @@ async def _run_codex_cli(
 
         env = _codex_process_env(codex_home_path)
 
-        returncode, stdout, stderr = await asyncio.to_thread(
-            _run_codex_process,
-            args,
-            prompt,
-            env,
-            timeout,
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+            start_new_session=os.name != "nt",
         )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(prompt.encode("utf-8")),
+                timeout=timeout,
+            )
+        except TimeoutError as exc:
+            await _stop_codex_process(process)
+            raise RuntimeError(
+                "Codex CLI 调用超时, 请稍后重试或检查本机 Codex 登录状态"
+            ) from exc
+        except asyncio.CancelledError:
+            await _stop_codex_process(process)
+            raise
 
         out = _clean_process_text(stdout)
         err = _clean_process_text(stderr)
         final_message = _read_output_file(output_path)
-        if returncode != 0:
-            detail = err or out or f"exit code {returncode}"
+        if process.returncode != 0:
+            detail = err or out or f"exit code {process.returncode}"
             raise RuntimeError(f"Codex CLI 调用失败: {detail[-1200:]}")
         result = final_message or out
         if not result:
@@ -645,24 +668,27 @@ async def _run_codex_cli(
         await asyncio.to_thread(_remove_tree_best_effort, run_path)
 
 
-def _run_codex_process(
-    args: Sequence[str],
-    prompt: str,
-    env: dict[str, str],
-    timeout: float,
-) -> tuple[int, bytes, bytes]:
+async def _stop_codex_process(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is not None:
+        return
     try:
-        proc = subprocess.run(
-            list(args),
-            input=prompt.encode("utf-8"),
-            capture_output=True,
-            env=env,
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("Codex CLI 调用超时, 请稍后重试或检查本机 Codex 登录状态") from exc
-    return proc.returncode, proc.stdout, proc.stderr
+        if os.name == "nt":
+            process.terminate()
+        else:
+            os.killpg(process.pid, signal.SIGTERM)
+        await asyncio.wait_for(process.wait(), timeout=2.0)
+        return
+    except (ProcessLookupError, TimeoutError):
+        pass
+    if process.returncode is None:
+        try:
+            if os.name == "nt":
+                process.kill()
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        await process.wait()
 
 
 def _codex_process_env(codex_home_path: Path) -> dict[str, str]:
