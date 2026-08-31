@@ -177,6 +177,10 @@ def required_trading_bars(
     )
 
 
+def required_holdout_bars(profile: str) -> int:
+    return validation_config_for_profile(profile).outer_test_bars
+
+
 def nested_fold_count(
     trading_bars: int,
     config: NestedValidationConfig,
@@ -227,6 +231,28 @@ def evaluate_candidate_gate(
         )
     if n_trades is None or n_trades < GATE_MIN_TRADES:
         reasons.append(f"requires at least {GATE_MIN_TRADES} OOS trades")
+    return CandidateGateResult(qualified=not reasons, reasons=tuple(reasons))
+
+
+def evaluate_holdout_gate(
+    *,
+    confidence: str | None,
+    sharpe: float | None,
+    max_drawdown: float | None,
+    n_trades: int | None,
+) -> CandidateGateResult:
+    """Single-window holdout gate; nested fold-count rules do not apply."""
+    reasons: list[str] = []
+    if confidence == "low":
+        reasons.append("exploratory results can only be saved as pending candidates")
+    if sharpe is None or sharpe < GATE_MIN_OOS_SHARPE:
+        reasons.append(f"requires a holdout Sharpe of at least {GATE_MIN_OOS_SHARPE}")
+    if max_drawdown is None or max_drawdown < GATE_MAX_DRAWDOWN:
+        reasons.append(
+            f"requires a max drawdown no worse than {abs(GATE_MAX_DRAWDOWN):.0%}"
+        )
+    if n_trades is None or n_trades < GATE_MIN_TRADES:
+        reasons.append(f"requires at least {GATE_MIN_TRADES} holdout trades")
     return CandidateGateResult(qualified=not reasons, reasons=tuple(reasons))
 
 

@@ -8,11 +8,19 @@ from typing import Any
 
 from app.backtest.mining import (
     nested_fold_count,
+    required_holdout_bars,
     required_outer_folds,
     required_trading_bars,
     validation_config_for_profile,
 )
+from app.services.regime_builder import load_regime_history
 from app.tickflow.repository import enriched_dirname
+
+
+class MiningPreflightError(ValueError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -122,6 +130,31 @@ def require_mining_availability(
         end=end,
     )
     if availability.eligible:
+        regime = load_regime_history(data_dir)
+        if regime.is_empty() or "date" not in regime.columns:
+            raise MiningPreflightError(
+                "regime_unavailable",
+                "市场环境数据不可用, 请先在数据页完成市场环境计算后再研究",
+            )
+        regime_dates = {str(value)[:10] for value in regime["date"].to_list()}
+        covered_dates = enriched_partition_dates(
+            data_dir,
+            asset_type,
+            start,
+            end,
+        )
+        missing = [
+            value.isoformat()
+            for value in covered_dates[:-1]
+            if value.isoformat() not in regime_dates
+        ]
+        if missing:
+            raise MiningPreflightError(
+                "regime_incomplete",
+                "市场环境数据覆盖不完整: "
+                f"T-1 对齐缺少 {len(missing)} 个交易日, 首个为 {missing[0]}, "
+                "请先补算对应区间",
+            )
         return availability
 
     if availability.effective_start is None:
@@ -132,8 +165,70 @@ def require_mining_availability(
             f"{availability.effective_end.isoformat()}"
         )
     fold_label = "outer fold" if availability.required_outer_folds == 1 else "outer folds"
-    raise ValueError(
+    raise MiningPreflightError(
+        "enriched_insufficient",
         f"{budget_profile} mining requires at least {availability.required_bars} "
         f"enriched trading bars for {availability.required_outer_folds} {fold_label}; "
-        f"effective range {effective_range} has {availability.trading_bars}"
+        f"effective range {effective_range} has {availability.trading_bars}",
     )
+
+
+def reserve_final_holdout(
+    data_dir: Path,
+    *,
+    asset_type: str,
+    budget_profile: str,
+    start: date | None = None,
+    end: date | None = None,
+) -> dict[str, Any]:
+    """Split the experiment range into an adaptive window and a sealed tail holdout."""
+    holdout_bars = required_holdout_bars(budget_profile)
+    config = validation_config_for_profile(budget_profile)
+    required_adaptive = required_trading_bars(config, required_outer_folds(budget_profile))
+    dates = enriched_partition_dates(data_dir, asset_type, start, end)
+    needed = required_adaptive + holdout_bars
+    if len(dates) < needed:
+        if not dates:
+            effective_range = "contains no enriched data"
+        else:
+            effective_range = f"{dates[0].isoformat()} to {dates[-1].isoformat()}"
+        raise MiningPreflightError(
+            "enriched_insufficient",
+            f"{budget_profile} autoresearch requires at least {needed} "
+            f"enriched trading bars ({required_adaptive} adaptive + "
+            f"{holdout_bars} final holdout); effective range {effective_range} "
+            f"has {len(dates)}",
+        )
+    adaptive_dates = dates[:-holdout_bars]
+    holdout_dates = dates[-holdout_bars:]
+    require_mining_availability(
+        data_dir,
+        asset_type=asset_type,
+        budget_profile=budget_profile,
+        start=start,
+        end=adaptive_dates[-1],
+    )
+    require_mining_availability(
+        data_dir,
+        asset_type=asset_type,
+        budget_profile=budget_profile,
+        start=start,
+        end=holdout_dates[-1],
+    )
+    return {
+        "adaptive_end": adaptive_dates[-1].isoformat(),
+        "start": holdout_dates[0].isoformat(),
+        "end": holdout_dates[-1].isoformat(),
+        "bars": holdout_bars,
+        "status": "reserved",
+        "mining_run_id": None,
+        "signature": None,
+        "sealed_at": None,
+        "sharpe": None,
+        "max_drawdown": None,
+        "n_trades": None,
+        "total_return": None,
+        "qualified": None,
+        "gate_reasons": None,
+        "error": None,
+    }

@@ -15,6 +15,7 @@ import {
   Rocket,
   Save,
   Settings2,
+  Sparkles,
   Square,
 } from 'lucide-react'
 import { EmptyState } from '@/components/EmptyState'
@@ -272,6 +273,7 @@ export function MiningWorkbench() {
   const [draft, setDraft] = useState<MiningDraft>(loadDraft)
   const [scheduleDraft, setScheduleDraft] = useState<MiningScheduleConfig | null>(null)
   const [correlationScope, setCorrelationScope] = useState<'all' | 'selected'>('selected')
+  const [researchReport, setResearchReport] = useState<{ runId: string; content: string } | null>(null)
   const task = useMiningTask()
   const runFromUrl = searchParams.get('run') || ''
   const selectedCandidate = searchParams.get('candidate') || ''
@@ -529,6 +531,11 @@ export function MiningWorkbench() {
     },
     onError: error => toast(`保存失败 · ${String((error as Error).message || error)}`, 'error'),
   })
+  const generateReport = useMutation({
+    mutationFn: (runId: string) => api.miningAssistantReport(runId),
+    onSuccess: value => setResearchReport({ runId: value.run_id, content: value.report }),
+    onError: error => toast(`AI 研究报告失败 · ${String((error as Error).message || error)}`, 'error'),
+  })
 
   const attachRun = (run: MiningRun) => {
     const params = new URLSearchParams(searchParams)
@@ -656,6 +663,17 @@ export function MiningWorkbench() {
           <div className="min-w-0">
             <SummaryStrip result={result} />
             <RequestSummaryLine result={result} />
+
+            <section className="border-b border-border bg-accent/[0.03]">
+              <div className="flex items-center justify-between gap-3 px-3 py-2">
+                <div className="min-w-0">
+                  <h2 className="flex items-center gap-1.5 text-xs font-semibold text-foreground"><Sparkles className="h-3.5 w-3.5 text-accent" />AI 研究结论</h2>
+                  <div className="mt-0.5 text-[9px] text-muted">只读取当前 run 的可信样本外结果，不参与门槛判定。</div>
+                </div>
+                <button type="button" disabled={generateReport.isPending} onClick={() => generateReport.mutate(result.run_id)} className="inline-flex h-7 shrink-0 items-center gap-1 rounded-btn border border-accent/30 px-2 text-[10px] text-accent hover:bg-accent/5 disabled:opacity-50">{generateReport.isPending ? <LoaderCircle className="h-3 w-3 animate-spin" /> : <Sparkles className="h-3 w-3" />}{researchReport?.runId === result.run_id ? '重新生成' : '生成报告'}</button>
+              </div>
+              {researchReport?.runId === result.run_id && <div className="whitespace-pre-wrap border-t border-border px-3 py-3 text-[10px] leading-5 text-secondary">{researchReport.content}</div>}
+            </section>
 
             <section className="border-b border-border">
               <div className="flex items-center justify-between px-3 py-2"><h2 className="text-xs font-semibold text-foreground">因子排名</h2><span className="text-[9px] text-muted">{result.methodology_version}</span></div>

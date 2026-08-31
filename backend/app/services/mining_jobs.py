@@ -103,11 +103,13 @@ def canonicalize_request(request: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def compute_run_signature(request: Mapping[str, Any], data_fingerprint: Any) -> str:
-    """Hash every request dimension and the data fingerprint using BLAKE2b."""
+    """Hash execution inputs and the data fingerprint using BLAKE2b."""
     import hashlib
 
+    execution_request = dict(request)
+    execution_request.pop("research_context", None)
     signature_input = {
-        "request": canonicalize_request(request),
+        "request": canonicalize_request(execution_request),
         "data_fingerprint": _canonicalize_json_value(data_fingerprint),
     }
     payload = json.dumps(
@@ -190,6 +192,28 @@ class MiningRunStore:
         with _STORE_LOCK:
             manifest = self._required_manifest(safe_run_id)
             return self._transition_locked(manifest, status, error=error)
+
+    def patch_fingerprint(self, run_id: str, patch: Mapping[str, Any]) -> dict[str, Any]:
+        """Merge holdout-only keys into a terminal run fingerprint without resigning."""
+        allowed = {"final_holdout_sealed", "final_holdout"}
+        if not isinstance(patch, Mapping) or not patch:
+            raise MiningRunValidationError("fingerprint patch must be a non-empty mapping")
+        unknown = set(patch) - allowed
+        if unknown:
+            raise MiningRunValidationError(
+                f"fingerprint patch contains unsupported keys: {sorted(unknown)}"
+            )
+        safe_run_id = self._validate_run_id(run_id)
+        clean_patch = cast(dict[str, Any], _canonicalize_json_value(patch))
+        with _STORE_LOCK:
+            manifest = self._required_manifest(safe_run_id)
+            fingerprint = dict(manifest.get("data_fingerprint") or {})
+            fingerprint.update(clean_patch)
+            manifest["data_fingerprint"] = fingerprint
+            # ponytail: keep original run_signature; holdout is post-hoc evidence
+            manifest["updated_at"] = _now_iso()
+            _atomic_write_json(self._run_dir(safe_run_id) / "manifest.json", manifest)
+            return manifest
 
     def write_summary(self, run_id: str, summary: Mapping[str, Any]) -> dict[str, Any]:
         """Atomically replace a run's scalar or compact aggregate summary."""

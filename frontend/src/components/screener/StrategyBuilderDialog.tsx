@@ -433,7 +433,7 @@ export function StrategyBuilderDialog({ open, onClose, onSavedId, mode = 'create
             {tab === 'ai' ? (
               <div className="flex items-center gap-2 text-[11px]">
                 <Sparkles className="h-3.5 w-3.5 text-amber-400 shrink-0" />
-                <span className="text-amber-400/80">步骤 1 描述策略规则 → 步骤 2 预览代码 → 保存</span>
+                <span className="text-amber-400/80">生成可交易策略代码，不走挖掘契约。步骤 1 描述策略规则 → 步骤 2 预览代码 → 保存</span>
                 <a href="https://github.com/shy3130/tickflow-stock-panel/blob/main/backend/app/strategy/prompts/strategy-guide.md"
                    target="_blank" rel="noopener noreferrer"
                    className="inline-flex items-center gap-1 text-accent/70 hover:text-accent transition-colors">

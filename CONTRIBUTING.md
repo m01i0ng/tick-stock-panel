@@ -251,6 +251,8 @@ pnpm build
 git diff --check
 ```
 
+PR 和 `main` 由 `.github/workflows/ci.yml` 运行后端全量 pytest、前端 `pnpm build` 和 Playwright e2e。这不替代上表的定向验证。
+
 - 后端至少运行受影响模块的测试，不应只运行新加的单个测试。
 - 新增文件和本次改动不得引入 Ruff 告警。不要为清理历史告警而在功能 PR 中全仓格式化。
 - 前端任何 TypeScript、组件、样式或 API 类型改动至少执行一次 `pnpm build`。

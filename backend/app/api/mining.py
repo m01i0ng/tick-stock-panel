@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 from collections.abc import AsyncIterator, Mapping, Sequence
 from datetime import date
@@ -19,6 +20,7 @@ from app.backtest.mining import (
     MAX_COMBINATION_SIZE,
     MAX_FINALISTS,
     evaluate_candidate_gate,
+    evaluate_holdout_gate,
 )
 from app.enriched_generation import EnrichedGenerationUnavailableError
 from app.services import preferences
@@ -31,6 +33,7 @@ from app.services.mining_jobs import (
     MiningRunValidationError,
 )
 from app.services.mining_preflight import (
+    MiningPreflightError,
     mining_availability,
     require_mining_availability,
 )
@@ -40,10 +43,28 @@ from app.services.mining_schedule import (
 )
 
 router = APIRouter(prefix="/api/backtest/mining", tags=["backtest"])
+logger = logging.getLogger(__name__)
 _FACTOR_IDS = frozenset(str(item["id"]) for item in FACTOR_COLUMNS)
 _MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
 _SSE_POLL_SECONDS = 0.5
 _SSE_HEARTBEAT_SECONDS = 15.0
+
+
+class MiningResearchContext(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    source: Literal["ai_assistant"] = "ai_assistant"
+    goal: str = Field(min_length=1, max_length=2000)
+    title: str = Field(min_length=1, max_length=80)
+    hypothesis: str = Field(min_length=1, max_length=600)
+    rationale: str = Field(min_length=1, max_length=1000)
+    expected_outcome: str = Field(min_length=1, max_length=600)
+    risks: list[Annotated[str, Field(min_length=1, max_length=300)]] = Field(
+        default_factory=list,
+        max_length=5,
+    )
+    ai_provider: str = Field(min_length=1, max_length=80)
+    ai_model: str = Field(default="", max_length=160)
 
 
 class MiningStartRequest(BaseModel):
@@ -64,6 +85,7 @@ class MiningStartRequest(BaseModel):
     beam_width: int = Field(12, ge=1, le=MAX_BEAM_WIDTH)
     max_finalists: int = Field(MAX_FINALISTS, ge=1, le=MAX_FINALISTS)
     force: bool = False
+    research_context: MiningResearchContext | None = None
 
     @field_validator("start", "end", mode="before")
     @classmethod
@@ -119,6 +141,40 @@ class MiningSchedulePatch(BaseModel):
     mining_budget_profile: Literal["balanced", "strict"] | None = None
 
 
+class MiningAssistantPlanRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    goal: str = Field(min_length=4, max_length=2000)
+    asset_type: Literal["stock", "etf"] = "stock"
+    start: date | None = None
+    end: date | None = None
+    budget_profile: Literal["exploratory", "balanced", "strict"] = "balanced"
+    commission_pct: float = Field(0.0002, ge=0.0, le=0.05, allow_inf_nan=False)
+    stamp_tax_pct: float = Field(0.0005, ge=0.0, le=0.05, allow_inf_nan=False)
+    slippage_bps: float = Field(5.0, ge=0.0, le=1000.0, allow_inf_nan=False)
+    correlation_threshold: float = Field(0.75, gt=0.0, le=1.0, allow_inf_nan=False)
+    max_combination_factors: int = Field(4, ge=1, le=MAX_COMBINATION_SIZE)
+    beam_width: int = Field(12, ge=1, le=MAX_BEAM_WIDTH)
+    max_finalists: int = Field(MAX_FINALISTS, ge=1, le=MAX_FINALISTS)
+
+    @field_validator("start", "end", mode="before")
+    @classmethod
+    def _iso_dates(cls, value: Any) -> Any:
+        return MiningStartRequest._iso_dates(value)
+
+    @model_validator(mode="after")
+    def _date_range(self) -> MiningAssistantPlanRequest:
+        if self.start is not None and self.end is not None and self.start > self.end:
+            raise ValueError("start must not be after end")
+        return self
+
+
+class MiningAssistantReportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    run_id: str = Field(min_length=1, max_length=160)
+
+
 @router.get("/availability")
 def get_availability(
     request: Request,
@@ -139,6 +195,15 @@ def get_availability(
         ).to_dict()
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/assistant/plan")
+async def create_assistant_plan(payload: MiningAssistantPlanRequest) -> dict[str, Any]:
+    del payload
+    raise HTTPException(
+        status_code=410,
+        detail="单次研究计划已停用, 请改用 POST /api/backtest/autoresearch/sessions 创建 Catalog 实验",
+    )
 
 
 @router.get("/runs")
@@ -173,6 +238,8 @@ def start_run(payload: MiningStartRequest, request: Request) -> dict[str, Any]:
             payload.strategy_ids,
             payload.asset_type,
         )
+        # 发布中的磁盘快照不可信, 先于 regime/bars 预检给出「数据更新」指引
+        request.app.state.repo.get_matrix_data_generation(payload.asset_type)
         require_mining_availability(
             request.app.state.repo.store.data_dir,
             asset_type=payload.asset_type,
@@ -207,6 +274,12 @@ def start_run(payload: MiningStartRequest, request: Request) -> dict[str, Any]:
         projected = _project_run(manager.store, manifest)
         projected["reused"] = existing is not None
         return projected
+    except MiningPreflightError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+            headers={"X-Mining-Preflight-Code": exc.code},
+        ) from exc
     except (MiningRunValidationError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except EnrichedGenerationUnavailableError as exc:
@@ -265,6 +338,46 @@ def get_result(run_id: str, request: Request) -> dict[str, Any]:
             status_code=500,
             detail="mining result artifacts are unavailable",
         ) from exc
+
+
+@router.post("/assistant/report")
+async def create_assistant_report(
+    payload: MiningAssistantReportRequest,
+    request: Request,
+) -> dict[str, Any]:
+    from app.services.ai_provider import (
+        ai_configured,
+        current_ai_model,
+        current_ai_provider,
+        generate_ai_text,
+    )
+    from app.services.research_assistant import build_report_messages
+
+    if not ai_configured():
+        raise HTTPException(status_code=503, detail="AI 未配置, 请先在设置页配置")
+    result = get_result(payload.run_id, request)
+    manifest = _required_manifest(_manager(request).store, payload.run_id)
+    context = manifest.get("request", {}).get("research_context")
+    try:
+        report = await generate_ai_text(
+            build_report_messages(
+                result,
+                context if isinstance(context, Mapping) else None,
+            ),
+            temperature=0.1,
+            max_tokens=1800,
+        )
+    except Exception as exc:
+        logger.warning("AI research reporting failed for %s: %s", payload.run_id, exc)
+        raise HTTPException(status_code=502, detail=f"AI 研究报告生成失败: {exc}") from exc
+    if not report.strip():
+        raise HTTPException(status_code=502, detail="AI 未返回研究报告")
+    return {
+        "run_id": payload.run_id,
+        "report": report.strip(),
+        "ai_provider": current_ai_provider(),
+        "ai_model": current_ai_model(),
+    }
 
 
 @router.get("/runs/{run_id}/events")
@@ -526,7 +639,11 @@ def _project_result(
     factors = [_clean_record(row) for row in frames["factors"].to_dicts()]
     correlation = _project_correlation(frames["correlation"])
     fold_records = [_project_fold(row) for row in frames["folds"].to_dicts()]
-    candidates = _project_candidates(frames["candidates"], fold_records)
+    candidates = _project_candidates(
+        frames["candidates"],
+        fold_records,
+        manifest=manifest,
+    )
     selected_signature = candidates[0]["signature"] if candidates else None
     folds = [
         _public_fold(row)
@@ -600,6 +717,8 @@ def _public_fold(row: Mapping[str, Any]) -> dict[str, Any]:
 def _project_candidates(
     frame: pl.DataFrame,
     folds: Sequence[Mapping[str, Any]],
+    *,
+    manifest: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
     required = {"signature", "name", "kind", "factor_names_json", "confidence"}
     if not required.issubset(frame.columns):
@@ -617,18 +736,17 @@ def _project_candidates(
             if fold["regime_state"] == "overall"
             and fold["candidate_signature"] == signature
         ]
-        gate = evaluate_candidate_gate(
-            confidence=row.get("confidence"),
-            valid_folds=row.get("valid_folds"),
-            positive_fold_ratio=row.get("oos_positive_fold_ratio"),
-            sharpe=row.get("oos_sharpe"),
-            max_drawdown=row.get("oos_max_drawdown"),
-            n_trades=row.get("oos_n_trades"),
-        )
+        publication_block_reason = _publication_block_reason(manifest, row)
+        gate = _candidate_publication_gate(manifest, row)
         candidate["gate"] = {
-            "qualified": gate.qualified,
-            "reasons": list(gate.reasons),
+            "qualified": gate.qualified and publication_block_reason is None,
+            "reasons": [
+                *gate.reasons,
+                *([publication_block_reason] if publication_block_reason else []),
+            ],
         }
+        candidate["publishable"] = gate.qualified and publication_block_reason is None
+        candidate["publish_block_reason"] = publication_block_reason
         candidates.append(candidate)
     candidates.sort(
         key=lambda item: (
@@ -637,6 +755,60 @@ def _project_candidates(
         )
     )
     return candidates
+
+
+def _candidate_publication_gate(manifest: Mapping[str, Any], row: Mapping[str, Any]):
+    fingerprint = manifest.get("data_fingerprint")
+    if (
+        isinstance(fingerprint, Mapping)
+        and fingerprint.get("source") == "autoresearch"
+        and fingerprint.get("final_holdout_sealed") is True
+        and isinstance(fingerprint.get("final_holdout"), Mapping)
+        and fingerprint["final_holdout"].get("signature") in (None, row.get("signature"))
+    ):
+        holdout = fingerprint["final_holdout"]
+        return evaluate_holdout_gate(
+            confidence=row.get("confidence"),
+            sharpe=holdout.get("sharpe"),
+            max_drawdown=holdout.get("max_drawdown"),
+            n_trades=holdout.get("n_trades"),
+        )
+    return evaluate_candidate_gate(
+        confidence=row.get("confidence"),
+        valid_folds=row.get("valid_folds"),
+        positive_fold_ratio=row.get("oos_positive_fold_ratio"),
+        sharpe=row.get("oos_sharpe"),
+        max_drawdown=row.get("oos_max_drawdown"),
+        n_trades=row.get("oos_n_trades"),
+    )
+
+
+def _publication_block_reason(
+    manifest: Mapping[str, Any],
+    row: Mapping[str, Any] | None = None,
+) -> str | None:
+    fingerprint = manifest.get("data_fingerprint")
+    if not (
+        isinstance(fingerprint, Mapping)
+        and fingerprint.get("source") == "autoresearch"
+    ):
+        return None
+    if fingerprint.get("final_holdout_sealed") is not True:
+        return "自动研究结果尚未完成密封最终留出集验证, 只能保存为待定候选"
+    holdout = fingerprint.get("final_holdout")
+    if not isinstance(holdout, Mapping):
+        return "自动研究结果缺少密封最终留出集证据, 只能保存为待定候选"
+    if row is not None and holdout.get("signature") not in (None, row.get("signature")):
+        return "密封最终留出集针对另一候选, 此候选不能发布"
+    gate = evaluate_holdout_gate(
+        confidence=None if row is None else row.get("confidence"),
+        sharpe=holdout.get("sharpe"),
+        max_drawdown=holdout.get("max_drawdown"),
+        n_trades=holdout.get("n_trades"),
+    )
+    if not gate.qualified:
+        return "密封最终留出集未通过发布门槛: " + "; ".join(gate.reasons)
+    return None
 
 
 def _project_regimes(

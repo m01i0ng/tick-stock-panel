@@ -227,6 +227,17 @@ def test_describe_and_issue_dataclass():
 # ── 开实时行情门禁 (钩子2) ──────────────────────────────────────────
 
 
+def _freeze_integrity_today(monkeypatch, day: date = TODAY) -> None:
+    """门禁测试写入固定 FRIDAY/TODAY 分区; 扫描默认用墙上时钟。"""
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.combine(day, time(12, 0), tzinfo=tz or CN_TZ)
+
+    monkeypatch.setattr("app.services.data_integrity.datetime", FrozenDateTime)
+
+
 def _gate_state(tmp_path, quote_service, repo):
     from types import SimpleNamespace
 
@@ -270,6 +281,7 @@ def test_realtime_gate_blocks_on_snapshot_and_launches_repair(tmp_path, monkeypa
     from app.api import settings as settings_api
     from app.services import data_integrity
 
+    _freeze_integrity_today(monkeypatch)
     _write_daily_partition(tmp_path, "kline_daily", FRIDAY, _ts_ms(FRIDAY, time(11, 58)))
     _write_daily_partition(tmp_path, "kline_daily", TODAY, _ts_ms(TODAY, time(10, 0)))
 
@@ -301,6 +313,7 @@ def test_realtime_gate_blocks_on_snapshot_and_launches_repair(tmp_path, monkeypa
 def test_realtime_gate_allows_clean_data(tmp_path, monkeypatch):
     from app.api import settings as settings_api
 
+    _freeze_integrity_today(monkeypatch)
     _write_daily_partition(tmp_path, "kline_daily", FRIDAY, None)
     _write_daily_partition(tmp_path, "kline_daily", TODAY, _ts_ms(TODAY, time(10, 0)))
 
@@ -321,6 +334,7 @@ def test_realtime_gate_allows_clean_data(tmp_path, monkeypatch):
 def test_realtime_gate_ignores_old_issues_beyond_window(tmp_path, monkeypatch):
     from app.api import settings as settings_api
 
+    _freeze_integrity_today(monkeypatch)
     old_day = TODAY - timedelta(days=AUTO_REPAIR_MAX_LAG_DAYS + 1)
     while old_day.weekday() >= 5:
         old_day -= timedelta(days=1)

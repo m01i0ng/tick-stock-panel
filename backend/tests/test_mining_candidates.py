@@ -58,25 +58,44 @@ def _create_run(
     definition: dict | None = None,
     status: str = "succeeded",
     run_id: str = "mining-run",
+    source: str | None = None,
+    request_source: str | None = None,
+    fingerprint_source: str | None = None,
 ) -> tuple[MiningRunStore, str, str]:
     definition = definition or _factor_definition()
     signature = compute_candidate_signature(definition)
     store = MiningRunStore(tmp_path)
+    request = {
+        "factor_names": ["turnover_rate", "rsi_14"],
+        "strategy_ids": ["existing_daily", "ma_golden_cross"],
+        "asset_type": "stock",
+        "start": "2025-01-01",
+        "end": "2026-01-09",
+        "budget_profile": "exploratory",
+        "commission_pct": 0.0002,
+        "stamp_tax_pct": 0.0005,
+        "slippage_bps": 5.0,
+    }
+    if request_source is not None:
+        request["research_context"] = {"source": request_source}
+    fingerprint = {"generation": "test"}
+    if fingerprint_source is not None:
+        fingerprint.update({
+            "source": fingerprint_source,
+            "source_session_id": "session-123",
+            "final_holdout_sealed": False,
+        })
     store.create(
-        {
-            "factor_names": ["turnover_rate", "rsi_14"],
-            "strategy_ids": ["existing_daily", "ma_golden_cross"],
-            "asset_type": "stock",
-            "start": "2025-01-01",
-            "end": "2026-01-09",
-            "budget_profile": "exploratory",
-            "commission_pct": 0.0002,
-            "stamp_tax_pct": 0.0005,
-            "slippage_bps": 5.0,
-        },
-        {"generation": "test"},
+        request,
+        fingerprint,
         run_id=run_id,
     )
+    if source is not None:
+        store.append_event(
+            run_id,
+            "queued",
+            {"status": "queued", "source": source},
+        )
     frame = pl.DataFrame({
         "signature": [signature],
         "name": ["因子组合候选"],
@@ -262,6 +281,127 @@ def test_publish_existing_strategy_returns_verified_id_and_repairs_backlink(tmp_
     persisted = pl.read_parquet(store.artifact_path(run_id, "candidates")).row(0, named=True)
     assert persisted["published_strategy_id"] == "existing_daily"
     assert CandidateStore(tmp_path).list() == []
+
+
+@pytest.mark.parametrize("source", ["manual", "scheduled"])
+def test_publish_manual_and_scheduled_sources_remain_allowed(tmp_path, source) -> None:
+    definition = {"kind": "existing_strategy", "strategy_id": "existing_daily"}
+    store, run_id, signature = _create_run(
+        tmp_path,
+        definition=definition,
+        source=source,
+    )
+
+    assert _service(tmp_path, store).publish(run_id, signature) == {
+        "ok": True,
+        "strategy_id": "existing_daily",
+    }
+
+
+def test_autoresearch_source_can_promote_pending_but_cannot_publish(tmp_path) -> None:
+    store, run_id, signature = _create_run(
+        tmp_path,
+        source="autoresearch:session-123",
+        fingerprint_source="autoresearch",
+    )
+    service = _service(tmp_path, store)
+
+    promoted = service.promote(run_id, signature)
+    assert promoted["status"] == "pending"
+    with pytest.raises(ValueError, match="sealed final holdout"):
+        service.publish(run_id, signature)
+
+    assert not (tmp_path / "strategies" / "custom").exists()
+
+
+def test_sealed_autoresearch_publish_uses_holdout_gate(tmp_path) -> None:
+    definition = {"kind": "existing_strategy", "strategy_id": "existing_daily"}
+    store, run_id, signature = _create_run(
+        tmp_path,
+        definition=definition,
+        source="autoresearch:session-123",
+        fingerprint_source="autoresearch",
+    )
+    store.patch_fingerprint(
+        run_id,
+        {
+            "final_holdout_sealed": True,
+            "final_holdout": {
+                "signature": signature,
+                "sharpe": 0.9,
+                "max_drawdown": -0.1,
+                "n_trades": 80,
+            },
+        },
+    )
+    assert _service(tmp_path, store).publish(run_id, signature)["ok"] is True
+
+
+def test_sealed_autoresearch_publish_rejects_failed_holdout_gate(tmp_path) -> None:
+    store, run_id, signature = _create_run(
+        tmp_path,
+        source="autoresearch:session-123",
+        fingerprint_source="autoresearch",
+    )
+    store.patch_fingerprint(
+        run_id,
+        {
+            "final_holdout_sealed": True,
+            "final_holdout": {
+                "signature": signature,
+                "sharpe": 0.1,
+                "max_drawdown": -0.1,
+                "n_trades": 80,
+            },
+        },
+    )
+    with pytest.raises(ValueError, match="holdout Sharpe"):
+        _service(tmp_path, store).publish(run_id, signature)
+
+
+def test_sealed_autoresearch_publish_rejects_other_candidate(tmp_path) -> None:
+    store, run_id, signature = _create_run(
+        tmp_path,
+        source="autoresearch:session-123",
+        fingerprint_source="autoresearch",
+    )
+    store.patch_fingerprint(
+        run_id,
+        {
+            "final_holdout_sealed": True,
+            "final_holdout": {
+                "signature": "other-signature",
+                "sharpe": 0.9,
+                "max_drawdown": -0.1,
+                "n_trades": 80,
+            },
+        },
+    )
+    with pytest.raises(ValueError, match="not the sealed final holdout"):
+        _service(tmp_path, store).publish(run_id, signature)
+
+
+def test_publication_source_uses_server_queued_event_not_request_context(tmp_path) -> None:
+    definition = {"kind": "existing_strategy", "strategy_id": "existing_daily"}
+    store, run_id, signature = _create_run(
+        tmp_path,
+        definition=definition,
+        source="manual",
+        request_source="autoresearch:client-claim",
+    )
+
+    assert _service(tmp_path, store).publish(run_id, signature)["ok"] is True
+
+
+def test_bounded_events_are_not_publication_provenance(tmp_path) -> None:
+    definition = {"kind": "existing_strategy", "strategy_id": "existing_daily"}
+    store, run_id, signature = _create_run(
+        tmp_path,
+        definition=definition,
+        source="autoresearch:untrusted-event-only",
+    )
+
+    assert _service(tmp_path, store).publish(run_id, signature)["ok"] is True
 
 
 def test_promote_requires_unique_artifact_signature(tmp_path) -> None:
