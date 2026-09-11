@@ -27,7 +27,7 @@ from typing import Any
 
 import polars as pl
 
-from app.indicators.pipeline import DEVIATION_WINDOWS
+from app.indicators.pipeline import BENCH_KEYS, DEVIATION_WINDOWS, bench_rt_pct_for
 
 # ── 规则表 ────────────────────────────────────────────────
 
@@ -55,6 +55,18 @@ RULES_META: list[dict[str, Any]] = [
 ]
 
 _BENCH_RT_CANDIDATES = ["000002.SH", "000001.SH", "399107.SZ", "399001.SZ", "899050.BJ"]
+
+
+def _bench_key_of(symbol: str) -> str:
+    """symbol → 板块基准键, 与 pipeline._bench_key_expr 同口径 (SH/STAR/SZ/GEM/BJ)。"""
+    code = symbol.split(".")[0]
+    if symbol.endswith(".BJ"):
+        return "BJ"
+    if symbol.endswith(".SH"):
+        return "STAR" if code.startswith("68") else "SH"
+    if symbol.endswith(".SZ"):
+        return "GEM" if code.startswith("30") else "SZ"
+    return ""
 
 
 def board_of(symbol: str) -> str:
@@ -134,7 +146,12 @@ def _hist_snapshot(repo: Any) -> dict[str, Any]:
 
 
 def _bench_rt_pct(quote_service: Any) -> float:
-    """基准指数今日实时涨跌 (各候选均值, 缺数据时 0)。"""
+    """基准指数今日实时涨跌 (各候选均值, 小数制, 缺数据时 0)。
+
+    quote_service.get_index_quotes() 返回指数展示缓存, change_pct/pct/pct_change
+    为百分数口径 (CONTRIBUTING §3.1), 消费前显式 /100, 与 enriched 侧小数制
+    change_pct 对齐 (#232); close/prev_close 兜底路径本身是小数, 不转换。
+    """
     try:
         df = quote_service.get_index_quotes()
     except Exception:
@@ -148,7 +165,7 @@ def _bench_rt_pct(quote_service: Any) -> float:
         if col in df.columns:
             vals = df[col].drop_nulls()
             if vals.len() > 0:
-                return float(vals.mean())
+                return float(vals.mean()) / 100.0
     if {"close", "prev_close"} <= set(df.columns):
         sub = df.select(["close", "prev_close"]).drop_nulls()
         if sub.height > 0:
@@ -169,6 +186,15 @@ def build_overview(
     hist_rows: dict[str, dict[str, Any]] = hist["rows"]
 
     bench_rt = _bench_rt_pct(quote_service) if quote_service is not None else 0.0
+    # 实时叠加按板块基准: 科创板减科创50、创业板减创业板综指, 不再全市场混均值
+    bench_by_key: dict[str, float] = {}
+    if quote_service is not None:
+        try:
+            index_quotes = quote_service.get_index_quotes()
+        except Exception:
+            index_quotes = None
+        for k in BENCH_KEYS:
+            bench_by_key[k] = bench_rt_pct_for(index_quotes, k)
     # enriched 已含今日收盘 (盘后已同步) 时, 今日涨跌已计入历史偏离, 不再叠加
     includes_today = cache_date is not None and cache_date >= date.today().isoformat()
 
@@ -176,7 +202,9 @@ def build_overview(
     for symbol, base in hist_rows.items():
         rule = rule_for(symbol, base.get("name"))
         rt_pct = base.get("rt_pct")
-        rt_delta = 0.0 if includes_today else ((rt_pct or 0.0) - bench_rt)
+        rt_delta = 0.0 if includes_today else (
+            (rt_pct or 0.0) - bench_by_key.get(_bench_key_of(symbol), 0.0)
+        )
 
         windows: dict[str, dict[str, Any]] = {}
         max_closeness = 0.0

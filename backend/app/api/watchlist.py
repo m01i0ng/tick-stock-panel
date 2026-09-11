@@ -5,6 +5,7 @@ import logging
 import math
 import time
 from datetime import date
+from typing import Callable
 
 import anyio
 import polars as pl
@@ -13,6 +14,7 @@ from pydantic import BaseModel
 
 from app.db_safe import is_valid_ext_ident, quote_ident
 from app.services import watchlist
+from app.services.watchlist_csv import import_watchlist_codes, import_watchlist_csv
 from app.services.watchlist_ocr import import_watchlist_image
 from app.services.watchlist_ocr.provider import get_ocr_provider
 
@@ -31,6 +33,35 @@ _IMPORT_IMAGE_TYPES = {
 }
 # OCR 独立并发上限：避免多张大图同时解码 + 多 Tesseract 子进程
 _OCR_LIMITER = anyio.CapacityLimiter(2)
+# CSV/TXT 导入：文本远小于截图，上限 5MB 足够
+_MAX_IMPORT_CSV_BYTES = 5 * 1024 * 1024
+_IMPORT_CSV_TYPES = {
+    "text/csv",
+    "text/plain",
+    "application/csv",
+}
+# 上传分块读取粒度 (与 ext_data 上传一致)
+_UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+
+async def _read_upload_capped(file: UploadFile, max_bytes: int, too_large: str) -> bytes:
+    """分块读取上传内容, 累计超过 max_bytes 立即拒绝(400), 返回完整字节。
+
+    与 ext_data._write_upload_capped 同类保护: 一次性 `await file.read()` 会先把整个
+    文件读入内存再比较长度, 上限在那之后才生效, 一个远超上限的上传照样把进程内存
+    顶满; 分块读取在越过上限的那一块就停止, 内存占用不超过上限 + 一块。
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(_UPLOAD_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(400, too_large)
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 class AddRequest(BaseModel):
@@ -43,6 +74,7 @@ class BatchAddRequest(BaseModel):
     symbols: list[str]
     note: str = ""
     group_id: str | None = None
+    group_ids: list[str] | None = None
 
 
 class GroupNameRequest(BaseModel):
@@ -56,6 +88,10 @@ class GroupReorderRequest(BaseModel):
 
 class GroupAssignRequest(BaseModel):
     group_id: str | None = None
+
+
+class ImportCodesRequest(BaseModel):
+    text: str
 
 
 def _with_names(rows: list[dict], request: Request) -> list[dict]:
@@ -89,7 +125,12 @@ def add_one(req: AddRequest, request: Request):
 @router.post("/batch")
 def add_batch(req: BatchAddRequest, request: Request):
     try:
-        rows, added = watchlist.add_batch(req.symbols, req.note, req.group_id)
+        rows, added = watchlist.add_batch(
+            req.symbols,
+            req.note,
+            group_id=req.group_id,
+            group_ids=req.group_ids,
+        )
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
     return {"symbols": _with_names(rows, request), "added": added}
@@ -167,11 +208,9 @@ async def import_from_image(request: Request, file: UploadFile = File(...)):
     if not ok_type and not ok_ext:
         raise HTTPException(400, "仅支持 JPG / PNG / WebP / BMP / GIF 图片")
 
-    data = await file.read()
+    data = await _read_upload_capped(file, _MAX_IMPORT_IMAGE_BYTES, "图片过大（上限 12MB）")
     if not data:
         raise HTTPException(400, "空文件")
-    if len(data) > _MAX_IMPORT_IMAGE_BYTES:
-        raise HTTPException(400, "图片过大（上限 12MB）")
 
     existing = {r["symbol"] for r in watchlist.list_symbols()}
     data_dir = request.app.state.repo.store.data_dir
@@ -192,6 +231,68 @@ async def import_from_image(request: Request, file: UploadFile = File(...)):
     # 响应不回传整段 raw_text（可能很长）；调试时可开 query，这里默认省略
     result.pop("raw_text", None)
     return result
+
+
+def _run_candidate_import(parse: Callable[[], dict], empty_msg: str) -> dict:
+    """执行候选解析：ValueError→400、其他→500、空候选→400、剥离 raw_text。"""
+    try:
+        result = parse()
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except Exception as e:  # noqa: BLE001
+        logger.exception("watchlist import failed")
+        raise HTTPException(500, f"解析失败: {e}") from e
+    if not result["candidates"]:
+        raise HTTPException(400, empty_msg)
+    result.pop("raw_text", None)
+    return result
+
+
+@router.post("/import-csv")
+async def import_from_csv(request: Request, file: UploadFile = File(...)):
+    """从 CSV / TXT 导入自选候选列表（不自动写入自选）。
+
+    兼容同花顺/东财/通达信导出（逗号或 Tab 分隔、UTF-8 或 GBK 编码）。目标分组
+    在候选确认时由前端传入 batch 接口，本端点只做解析与主数据校验。
+    """
+    content_type = (file.content_type or "").split(";")[0].strip().lower()
+    filename = (file.filename or "").lower()
+    ok_type = content_type in _IMPORT_CSV_TYPES
+    ok_ext = filename.endswith((".csv", ".txt"))
+    if not ok_type and not ok_ext:
+        raise HTTPException(400, "仅支持 CSV / TXT 文件")
+
+    data = await _read_upload_capped(file, _MAX_IMPORT_CSV_BYTES, "文件过大（上限 5MB）")
+    if not data:
+        raise HTTPException(400, "空文件")
+
+    data_dir = request.app.state.repo.store.data_dir
+    # 解码与自选/instruments parquet 读取为同步 CPU/IO，挪线程池避免卡事件循环
+    return await anyio.to_thread.run_sync(
+        lambda: _run_candidate_import(
+            lambda: import_watchlist_csv(
+                data,
+                data_dir,
+                existing_symbols={r["symbol"] for r in watchlist.list_symbols()},
+            ),
+            "文件中未识别到股票代码或名称",
+        )
+    )
+
+
+@router.post("/import-codes")
+def import_from_codes(req: ImportCodesRequest, request: Request):
+    """从粘贴的证券代码导入自选候选列表（不自动写入自选）。"""
+    text = req.text.strip()
+    if not text:
+        raise HTTPException(400, "请输入要导入的股票代码")
+
+    existing = {r["symbol"] for r in watchlist.list_symbols()}
+    data_dir = request.app.state.repo.store.data_dir
+    return _run_candidate_import(
+        lambda: import_watchlist_codes(text, data_dir, existing_symbols=existing),
+        "未识别到股票代码",
+    )
 
 
 @router.post("/{symbol}/top")

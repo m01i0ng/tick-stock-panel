@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -30,6 +31,8 @@ _REQUIRED = {
     "adj_factor": {"symbol", "trade_date", "ex_factor"},
     "realtime": {"symbol", "last_price", "prev_close", "open", "high", "low", "volume"},
     "minute": {"symbol", "datetime", "open", "high", "low", "close", "volume", "amount"},
+    # full_minute (全量分钟) 与 minute 同形: 当日窗口批量拉取, 字段映射一致
+    "full_minute": {"symbol", "datetime", "open", "high", "low", "close", "volume", "amount"},
     # financial 字段由数据源决定, 只要求能映射出 symbol
     "financial": {"symbol"},
 }
@@ -116,7 +119,7 @@ class GenericHTTPProvider:
                     errors.append(f"{dataset}: pct_unit 必须是 percent 或 decimal")
             if dataset != "realtime":
                 request_params = [cfg.symbols_param, cfg.start_param, cfg.end_param]
-                if dataset == "minute":
+                if dataset in {"minute", "full_minute"}:
                     request_params.extend(
                         name for name in (cfg.asset_type_param, cfg.freq_param) if name
                     )
@@ -130,6 +133,23 @@ class GenericHTTPProvider:
                     )
         return errors
 
+    def _request_rows_retry(
+        self, cfg, symbols: list[str], *, start_time=None, end_time=None, retries: int = 1
+    ) -> list[dict]:
+        """单批请求 + 短退避重试。仍失败抛出, 由调用方决定隔离粒度 (#226)。"""
+        last: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                return self._request_rows(
+                    cfg, symbols=symbols, start_time=start_time, end_time=end_time
+                )
+            except Exception as e:  # noqa: BLE001
+                last = e
+                if attempt < retries:
+                    time.sleep(1.0 * (attempt + 1))
+        assert last is not None
+        raise last
+
     def get_daily(
         self,
         symbols: list[str],
@@ -141,15 +161,35 @@ class GenericHTTPProvider:
         cfg = self._dataset("daily")
         frames: list[pl.DataFrame] = []
         chunks = chunked(symbols, cfg.batch)
+        failed: list[str] = []
         for i, chunk in enumerate(chunks):
             sleep_between_batches(i, cfg.rpm)
-            rows = self._request_rows(cfg, symbols=chunk, start_time=start_time, end_time=end_time)
+            try:
+                rows = self._request_rows_retry(
+                    cfg, chunk, start_time=start_time, end_time=end_time
+                )
+            except Exception as e:  # noqa: BLE001
+                # 单批失败只隔离该批 (#226): 之前任一批 502 会让整个 stage
+                # 抛异常, 已成功批次的结果留在内存里全部丢弃
+                failed.extend(chunk)
+                logger.warning(
+                    "custom daily: batch %d/%d failed (%d symbols), skipped: %s",
+                    i + 1, len(chunks), len(chunk), e,
+                )
+                if on_chunk_done:
+                    on_chunk_done(i + 1, len(chunks))
+                continue
             df = self._mapped_frame(cfg, rows)
             df = normalize_daily(df, source=self.name)
             if not df.is_empty():
                 frames.append(df)
             if on_chunk_done:
                 on_chunk_done(i + 1, len(chunks))
+        if failed:
+            logger.warning(
+                "custom daily: %d/%d symbols missing due to batch failures: %s",
+                len(failed), len(symbols), ", ".join(failed[:20]),
+            )
         return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
 
     def get_adj_factors(
@@ -163,15 +203,33 @@ class GenericHTTPProvider:
         cfg = self._dataset("adj_factor")
         frames: list[pl.DataFrame] = []
         chunks = chunked(symbols, cfg.batch)
+        failed: list[str] = []
         for i, chunk in enumerate(chunks):
             sleep_between_batches(i, cfg.rpm)
-            rows = self._request_rows(cfg, symbols=chunk, start_time=start_time, end_time=end_time)
+            try:
+                rows = self._request_rows_retry(
+                    cfg, chunk, start_time=start_time, end_time=end_time
+                )
+            except Exception as e:  # noqa: BLE001
+                failed.extend(chunk)
+                logger.warning(
+                    "custom adj_factor: batch %d/%d failed (%d symbols), skipped: %s",
+                    i + 1, len(chunks), len(chunk), e,
+                )
+                if on_chunk_done:
+                    on_chunk_done(i + 1, len(chunks))
+                continue
             df = self._mapped_frame(cfg, rows)
             df = normalize_adj_factors(df, source=self.name)
             if not df.is_empty():
                 frames.append(df)
             if on_chunk_done:
                 on_chunk_done(i + 1, len(chunks))
+        if failed:
+            logger.warning(
+                "custom adj_factor: %d/%d symbols missing due to batch failures: %s",
+                len(failed), len(symbols), ", ".join(failed[:20]),
+            )
         return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
 
     def get_realtime(self) -> list[dict]:
@@ -205,7 +263,38 @@ class GenericHTTPProvider:
         配置的参数名注入请求 (GET → params, POST → body), 用于上游需区分
         stock/ETF/index 或固定频率的场景。
         """
-        cfg = self._dataset("minute")
+        return self._fetch_minute_dataset(
+            "minute", symbols, start_time, end_time, asset_type, freq, on_chunk_done,
+        )
+
+    def get_intraday_batch(
+        self,
+        symbols: list[str],
+        count: int = 300,  # noqa: ARG002 — 与插件契约对齐, YAML 源按时间窗口取全天
+        asset_type: AssetType = "stock",
+    ) -> pl.DataFrame:
+        """全量分钟修复轮: 按当日窗口批量拉取 full_minute 数据集 (chunked + rpm 限速)。
+
+        与 get_minute 同形 (字段映射/归一一致), 区别仅在数据集名与窗口由调用方
+        传当日值。稳态增量 (get_intraday_latest) YAML 声明式源不提供 — 服务自动
+        降级为仅修复轮模式并放慢节奏。
+        """
+        start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        return self._fetch_minute_dataset(
+            "full_minute", symbols, start, datetime.now(), asset_type, "1m", None,
+        )
+
+    def _fetch_minute_dataset(
+        self,
+        ds_name: str,
+        symbols: list[str],
+        start_time: datetime | None,
+        end_time: datetime | None,
+        asset_type: AssetType = "stock",
+        freq: str = "1m",
+        on_chunk_done: Callable[[int, int], None] | None = None,
+    ) -> pl.DataFrame:
+        cfg = self._dataset(ds_name)
         override: dict[str, Any] = {}
         if cfg.asset_type_param:
             override[cfg.asset_type_param] = asset_type
@@ -260,18 +349,45 @@ class GenericHTTPProvider:
             return pl.DataFrame()
         return pl.concat(frames, how="diagonal_relaxed")
 
-    @staticmethod
-    def _normalize_minute(df: pl.DataFrame) -> pl.DataFrame:
+    @classmethod
+    def _normalize_minute(cls, df: pl.DataFrame) -> pl.DataFrame:
         """把映射后的 df 规范成 minute canonical 列。"""
         if df.is_empty():
             return df
         if "datetime" in df.columns and df.schema["datetime"] != pl.Datetime("us"):
+            if df.schema["datetime"] == pl.Utf8:
+                # 字符串 datetime 直接 cast 会整体置 null (polars 不做字符串解析);
+                # 先解析再对齐微秒精度 (#225, 参照
+                # kline_sync._enforce_minute_beijing_wallclock 的处理)。
+                # Series 级立即解析: 表达式错误要到 collect 才抛, 无法按格式回退
+                df = df.with_columns(cls._parse_datetime_series(df["datetime"]))
             df = df.with_columns(pl.col("datetime").cast(pl.Datetime("us"), strict=False))
         for col in ("open", "high", "low", "close", "volume", "amount"):
             if col in df.columns:
                 df = df.with_columns(pl.col(col).cast(pl.Float64, strict=False))
         keep = [c for c in ("symbol", "datetime", "open", "high", "low", "close", "volume", "amount") if c in df.columns]
         return df.select(keep) if keep else pl.DataFrame()
+
+    _DATETIME_STR_FORMATS = (
+        None,  # 自动推断
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+    )
+
+    @classmethod
+    def _parse_datetime_series(cls, s: pl.Series) -> pl.Series:
+        """逐格式尝试解析字符串 datetime; 均失败返回全 null (宽松语义)。"""
+        for fmt in cls._DATETIME_STR_FORMATS:
+            try:
+                return (
+                    s.str.to_datetime(strict=False, format=fmt)
+                    if fmt else s.str.to_datetime(strict=False)
+                )
+            except Exception:  # noqa: BLE001 — 该格式不适用, 换下一个
+                continue
+        return pl.Series("datetime", [None] * s.len(), dtype=pl.Datetime("us"))
 
     def test_dataset(self, dataset: str, symbols: list[str] | None = None) -> dict:
         cfg = self._dataset(dataset)
@@ -280,7 +396,7 @@ class GenericHTTPProvider:
         start_time = end_time - timedelta(days=7)
         if dataset == "realtime":
             rows = self._request_rows(cfg)
-        elif dataset == "minute":
+        elif dataset in {"minute", "full_minute"}:
             override: dict[str, Any] = {}
             if cfg.asset_type_param:
                 override[cfg.asset_type_param] = "stock"

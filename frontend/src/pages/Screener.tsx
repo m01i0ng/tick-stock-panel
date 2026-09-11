@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
 import { ScanSearch, Clock, TrendingUp, Star, Filter, Layers, Network, Sparkles, RefreshCw, Settings2, Store, RotateCcw, X } from 'lucide-react'
 import { api, genRuleId, type ScreenerStrategy, type ScreenerResult } from '@/lib/api'
+import { fetchMinuteBatchIncremental } from '@/lib/minuteBatchIncremental'
 import { DEFAULT_STRATEGY_NOTIFY_EVENTS } from '@/lib/strategyMonitorEvents'
 import { toast } from '@/components/Toast'
 import { useDataStatus, usePreferences, useCapabilities, useQuoteStatus } from '@/lib/useSharedQueries'
@@ -12,7 +13,7 @@ import { storage } from '@/lib/storage'
 import { PageHeader } from '@/components/PageHeader'
 import { EmptyState } from '@/components/EmptyState'
 import { DatePicker } from '@/components/DatePicker'
-import { StockPreviewDialog } from '@/components/StockPreviewDialog'
+import { StockPreviewDialog, type NavItem } from '@/components/StockPreviewDialog'
 import { WatchlistAddMenu } from '@/components/WatchlistAddMenu'
 import { useStrategyPool } from '@/lib/useStrategyPool'
 import { StrategyCard, CardSize, loadCardSize, cardWrapCls } from '@/components/screener/StrategyCard'
@@ -49,7 +50,12 @@ export function Screener() {
   const [batchMsg, setBatchMsg] = useState<string>('')
   const [previewSymbol, setPreviewSymbol] = useState<string | null>(null)
   const [previewName, setPreviewName] = useState<string>('')
-  const closePreview = useCallback(() => { setPreviewSymbol(null); setPreviewName('') }, [])
+  const [previewNavList, setPreviewNavList] = useState<NavItem[]>([])
+  const closePreview = useCallback(() => {
+    setPreviewSymbol(null)
+    setPreviewName('')
+    setPreviewNavList([])
+  }, [])
   const [settingsStrategyId, setSettingsStrategyId] = useState<string | null>(null)
   const [showPoolDialog, setShowPoolDialog] = useState(false)
   const [showBuilder, setShowBuilder] = useState(false)
@@ -73,6 +79,15 @@ export function Screener() {
     setIntradayChartVisible(v => {
       const next = !v
       storage.screenerIntraday.set(next)
+      return next
+    })
+  }, [])
+  // 策略列标签全表展开/收起（命中多策略时行会很高；默认收起, 每行可单独展开；持久化）
+  const [strategyTagsExpanded, setStrategyTagsExpanded] = useState<boolean>(() => storage.screenerStrategyTags.get(false))
+  const toggleStrategyTags = useCallback(() => {
+    setStrategyTagsExpanded(v => {
+      const next = !v
+      storage.screenerStrategyTags.set(next)
       return next
     })
   }, [])
@@ -109,6 +124,9 @@ export function Screener() {
   const [expiredCounts, setExpiredCounts] = useState<Record<string, number>>({})
   // 各策略显示上限 (null = 全部)
   const [strategyLimits, setStrategyLimits] = useState<Record<string, number | null>>({})
+  // run_all 渐进式返回后仍在后台计算的策略 (startedAt 为后端时钟, 用于判断缓存新旧)
+  const [pendingRun, setPendingRun] = useState<{ ids: string[]; startedAt: number } | null>(null)
+  const pendingRunIds = useMemo(() => new Set(pendingRun?.ids ?? []), [pendingRun])
 
   // 筛选条件变化时同步到 map（供切换策略时读取最新值）
   useEffect(() => {
@@ -146,10 +164,12 @@ export function Screener() {
 
   // 卡片首屏只读取轻量摘要；明细在点击策略或“全部”时按需加载。
   // 摘要只覆盖日线缓存; 分钟策略命中数来自手动单跑。
+  // run_all 渐进式返回后后台仍在算 → 轮询摘要, 算完的策略逐个点亮。
   const summaryQuery = useQuery({
     queryKey: QK.screenerCachedSummary,
     queryFn: api.screenerCachedSummary,
     enabled: assetType === 'stock',
+    refetchInterval: pendingRun ? 2000 : false,
   })
 
   const fullCachedQuery = useQuery({
@@ -258,6 +278,13 @@ export function Screener() {
         counts[id] = item.total
       }
       setHitCounts(prev => ({ ...prev, ...counts }))
+      // 渐进式返回: 慢策略后台继续算, 开启摘要轮询逐个点亮
+      setPendingRun(
+        data.pending?.length
+          ? { ids: [...data.pending], startedAt: data.started_at ?? 0 }
+          : null,
+      )
+      if (data.error) toast(`策略计算失败：${data.error}`, 'error')
       qc.invalidateQueries({ queryKey: ['screener-cached'] })
     },
   })
@@ -300,7 +327,27 @@ export function Screener() {
     }
     setHitCounts(counts)
     setExpiredCounts(expired)
-  }, [summaryQuery.data, asOf])
+    // 渐进式: computed_at 晚于本轮起点的策略已算完, 从 pending 中移除;
+    // 无 computed_at (监控实时叠加/旧缓存) 视为新鲜。容差吸收前后端时钟差。
+    if (pendingRun) {
+      const arrived = (id: string) => {
+        const r = summaryQuery.data!.results[id]
+        if (!r || r.as_of !== asOf) return false
+        return r.computed_at == null || r.computed_at >= pendingRun.startedAt - 2000
+      }
+      const rest = pendingRun.ids.filter(id => !arrived(id))
+      if (rest.length !== pendingRun.ids.length) {
+        setPendingRun(rest.length ? { ...pendingRun, ids: rest } : null)
+      }
+    }
+  }, [summaryQuery.data, asOf, pendingRun])
+
+  // 渐进式兜底: 后台计算最长等 8 分钟, 防止异常时无限轮询
+  useEffect(() => {
+    if (!pendingRun) return
+    const t = setTimeout(() => setPendingRun(null), 8 * 60 * 1000)
+    return () => clearTimeout(t)
+  }, [pendingRun])
 
   // 当前单策略缓存更新后同步明细；参数保存的强制重算结果仍由 run 直接覆盖。
   useEffect(() => {
@@ -428,6 +475,14 @@ export function Screener() {
   )
   // 分时图依赖分钟K批量数据 (kline.minute.batch), 无数据时开了列也不拉
   const caps = useCapabilities()
+  // 全量分钟服务健康 (freshness 契约): 健康时本地分区按配置间隔持续落盘,
+  // 分时读本地不受批量上限约束 → 不截断 + prefer_local; 与监控设置页共享缓存
+  const refreshStatus = useQuery({
+    queryKey: ['minute-refresh-status'],
+    queryFn: api.minuteRefreshStatus,
+    refetchInterval: 15000,
+  })
+  const fullMinuteHealthy = !!refreshStatus.data?.healthy
   const hasMinuteBatch = !!caps.data?.capabilities?.['kline.minute.batch']
   const intradayVisible = !!intradayColumn && hasMinuteBatch && intradayChartVisible
 
@@ -446,11 +501,11 @@ export function Screener() {
     () => displayRows.map((r: any) => r.symbol),
     [displayRows],
   )
-  const intradayTruncated = intradayVisible && allIntradaySymbols.length > minuteBatchCap
-  // 截断到 batch 上限, 一次请求 = 一次数据源调用
+  // 拉模型 (走批量接口) 才截断到 batch 上限; 全量分钟健康时读本地分区无上限
+  const intradayTruncated = intradayVisible && !fullMinuteHealthy && allIntradaySymbols.length > minuteBatchCap
   const intradaySymbols = useMemo(
     () => intradayTruncated ? allIntradaySymbols.slice(0, minuteBatchCap) : allIntradaySymbols,
-    [allIntradaySymbols, intradayTruncated, minuteBatchCap],
+    [allIntradaySymbols, intradayTruncated, minuteBatchCap, fullMinuteHealthy],
   )
   const intradayRequestSymbols = useMemo(
     () => [...new Set(intradaySymbols)].sort(),
@@ -460,7 +515,8 @@ export function Screener() {
 
   const minuteBatch = useQuery({
     queryKey: QK.minuteBatch(intradaySymbolsKey),
-    queryFn: () => api.klineMinuteBatch(intradayRequestSymbols),
+    // 增量轮询: 读缓存以最后一根为 since 只拉新增, 本地合并为完整序列
+    queryFn: () => fetchMinuteBatchIncremental(qc, QK.minuteBatch(intradaySymbolsKey), intradayRequestSymbols, fullMinuteHealthy),
     enabled: intradayVisible && intradayRequestSymbols.length > 0,
     staleTime: 10_000,
     placeholderData: previousData => previousData,
@@ -793,6 +849,7 @@ export function Screener() {
                   count={hitCounts[id]}
                   expiredCount={expiredCounts[id]}
                   loading={runAll.isPending}
+                  computing={pendingRunIds.has(id)}
                   cardSize={cardSize}
                   onRun={() => handleRun(s)}
                   disabled={run.isPending && activeStrategy === s.id}
@@ -963,8 +1020,9 @@ export function Screener() {
                     strategyIdToName={strategyIdToName}
                     symbolStrategyMap={symbolStrategyMap}
                     activeStrategy={activeStrategy}
+                    activeSymbol={previewSymbol}
                     watchlistSet={watchlistSet}
-                    onPreview={(symbol, name) => { setPreviewSymbol(symbol); setPreviewName(name) }}
+                    onPreview={(symbol, name, navList) => { setPreviewSymbol(symbol); setPreviewName(name ?? ''); setPreviewNavList(navList ?? []) }}
                     onAddToWatchlist={(symbol, groupId) => toggleWatchlist.mutate({ symbol, action: 'add', groupId })}
                     onRemoveFromWatchlist={symbol => toggleWatchlist.mutate({ symbol, action: 'remove' })}
                     watchlistPending={toggleWatchlist.isPending}
@@ -977,6 +1035,8 @@ export function Screener() {
                     intradayAutoRefresh={intradayRefreshEnabled && realtimeRunning}
                     onRefreshIntraday={() => minuteBatch.refetch()}
                     intradayRefreshing={minuteBatch.isFetching}
+                    strategyTagsExpanded={strategyTagsExpanded}
+                    onToggleStrategyTags={toggleStrategyTags}
                     sort={sort}
                     onSortToggle={toggle}
                   />
@@ -1014,6 +1074,8 @@ export function Screener() {
         symbol={previewSymbol}
         name={previewName}
         onClose={closePreview}
+        navList={previewNavList}
+        onNavigate={(sym, n) => { setPreviewSymbol(sym); setPreviewName(n ?? '') }}
       />
 
       <StrategySettingsDialog
@@ -1061,6 +1123,14 @@ export function Screener() {
         <StrategyPoolDialog
           pool={pool}
           onConfirm={(newPool) => {
+            // 新增的日线策略立即自动扫描, 免去手动点刷新; 纯排序/删除不重跑
+            if (assetType === 'stock') {
+              const prev = new Set(pool)
+              const addedDaily = newPool.filter(
+                id => !prev.has(id) && !(strategyMap.get(id)?.timeframes?.includes('1m') ?? false),
+              )
+              if (addedDaily.length > 0) requestRunAll({ date: asOf || undefined, strategyIds: addedDaily })
+            }
             reorderPool(newPool)
           }}
           onClose={() => setShowPoolDialog(false)}
@@ -1071,12 +1141,22 @@ export function Screener() {
         onClose={() => setShowBuilder(false)}
         mode={builderMode}
         existingStrategyIds={allStrategyIds}
-        onSavedId={async id => {
+        onSavedId={async (id, researchOnly) => {
+          if (researchOnly) {
+            // AI 策略保存为 research_only 草稿, 不进入策略池, 提示用户去策略池发布
+            toast('AI 策略已保存为草稿，请在策略池「AI」标签发布后使用', 'success')
+            return
+          }
           const data = await qc.fetchQuery({ queryKey: QK.screenerStrategies('all'), queryFn: () => api.screenerStrategies(), staleTime: 0 })
           if (!data.presets.some(s => s.id === id)) {
             throw new Error(`策略 ${id} 已保存但未加载，请检查策略代码`)
           }
           addToPool(id)
+          // 新建策略为日线时立即扫描, 免去手动点刷新 (分钟策略仍手动单跑)
+          const preset = data.presets.find(s => s.id === id)
+          if (assetType === 'stock' && preset && !preset.timeframes?.includes('1m')) {
+            requestRunAll({ date: asOf || undefined, strategyIds: [id] })
+          }
         }}
       />
 
@@ -1084,8 +1164,13 @@ export function Screener() {
         open={showComposite}
         onClose={() => setShowComposite(false)}
         onSavedId={async id => {
-          await qc.fetchQuery({ queryKey: QK.screenerStrategies('all'), queryFn: () => api.screenerStrategies(), staleTime: 0 })
+          const data = await qc.fetchQuery({ queryKey: QK.screenerStrategies('all'), queryFn: () => api.screenerStrategies(), staleTime: 0 })
           addToPool(id)
+          // 新建叠加策略为日线时立即扫描, 免去手动点刷新 (分钟策略仍手动单跑)
+          const preset = data.presets.find(s => s.id === id)
+          if (assetType === 'stock' && preset && !preset.timeframes?.includes('1m')) {
+            requestRunAll({ date: asOf || undefined, strategyIds: [id] })
+          }
         }}
       />
 

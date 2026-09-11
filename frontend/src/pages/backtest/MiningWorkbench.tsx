@@ -15,12 +15,14 @@ import {
   Rocket,
   Save,
   Settings2,
+  Sparkles,
   Square,
 } from 'lucide-react'
 import { EmptyState } from '@/components/EmptyState'
 import { toast } from '@/components/Toast'
 import {
   api,
+  type AutoScreening,
   type FactorColumn,
   type MiningBudgetProfile,
   type MiningCandidateGate,
@@ -38,6 +40,9 @@ import {
   useMiningTask,
 } from '@/lib/miningTask'
 import { QK } from '@/lib/queryKeys'
+import { usePreferences } from '@/lib/useSharedQueries'
+import { useToggleRealtimeQuotes } from '@/lib/useSharedMutations'
+import { useDialogBackdrop } from '@/lib/useDialogBackdrop'
 import { FactorCorrelationHeatmap } from './charts/FactorCorrelationHeatmap'
 import { MiningOosChart } from './charts/MiningOosChart'
 import { RegimeComparisonChart } from './charts/RegimeComparisonChart'
@@ -191,6 +196,62 @@ function foldKindLabel(kind?: string | null) {
   return undefined
 }
 
+function pctText(value: number | null | undefined, digits = 1) {
+  return typeof value === 'number' && Number.isFinite(value) ? `${(value * 100).toFixed(digits)}%` : '—'
+}
+
+/** 自动挖掘 L1 筛选摘要: 达标因子清单 + 失败原因分布 (来自任务请求的 auto_screening)。 */
+function AutoScreeningCard({ screening }: { screening: AutoScreening }) {
+  const gate = screening.gate
+  const reasons = Object.entries(screening.reason_counts).slice(0, 5)
+  const maxCount = Math.max(1, ...reasons.map(([, count]) => count))
+  return (
+    <section className="border-b border-border bg-accent/[0.03]">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2">
+        <span className="inline-flex items-center gap-1 text-xs font-semibold text-foreground">
+          <Sparkles className="h-3.5 w-3.5 text-accent" />
+          自动筛选 · 达标因子池
+        </span>
+        <span className="font-mono text-[10px] text-secondary">
+          {screening.n_qualified}/{screening.n_total} 个达标
+          {screening.pool_truncated ? `（取前 ${screening.pool.length} 个入池）` : ''}
+        </span>
+        <span className="text-[10px] text-muted">
+          门槛 |IC|≥{gate.min_abs_ic.toFixed(2)} · |IR|≥{gate.min_abs_ir.toFixed(2)} · |t|≥{gate.min_abs_t.toFixed(1)} · q≤{gate.max_q.toFixed(2)}
+          ，窗口 {screening.screen_window.start} ~ {screening.screen_window.end}
+        </span>
+      </div>
+      {screening.qualified.length > 0 && (
+        <div className="flex flex-wrap gap-1 px-3 pb-2">
+          {screening.qualified.map(item => (
+            <span
+              key={item.factor_name}
+              title={`${item.factor_name} · IC ${pctText(item.ic)} · IR ${item.ir?.toFixed(2) ?? '—'} · t ${item.t?.toFixed(2) ?? '—'} · q ${item.q?.toFixed(3) ?? '—'}`}
+              className={`inline-flex items-center gap-1 rounded-btn border px-1.5 py-0.5 text-[10px] font-medium ${item.direction > 0 ? 'border-bull/30 bg-bull/10 text-bull' : 'border-bear/30 bg-bear/10 text-bear'}`}
+            >
+              {item.label}
+              {item.direction > 0 ? '↑' : '↓'}
+              <span className="font-mono opacity-80">{pctText(item.ic)}</span>
+            </span>
+          ))}
+        </div>
+      )}
+      {reasons.length > 0 && (
+        <div className="space-y-1 border-t border-border/60 px-3 py-2">
+          <div className="text-[10px] text-muted">未达标原因分布（{screening.n_total - screening.n_qualified} 个）：</div>
+          {reasons.map(([reason, count]) => (
+            <div key={reason} className="flex items-center gap-2 text-[10px]">
+              <span className="w-24 shrink-0 truncate text-secondary" title={reason}>{reason}</span>
+              <span className="h-1.5 rounded-full bg-accent/40" style={{ width: `${Math.max(6, (count / maxCount) * 140)}px` }} />
+              <span className="font-mono text-muted">{count}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  )
+}
+
 function SummaryStrip({ result }: { result: MiningResult }) {
   const items = [
     ['因子', `${result.summary.selected_factor_count}/${result.summary.factor_count}`],
@@ -273,6 +334,21 @@ export function MiningWorkbench() {
   const [scheduleDraft, setScheduleDraft] = useState<MiningScheduleConfig | null>(null)
   const [correlationScope, setCorrelationScope] = useState<'all' | 'selected'>('selected')
   const task = useMiningTask()
+  // 实时行情开启时盘中 enriched 持续落盘, 排队中的挖掘任务开跑会因数据世代
+  // 校验失败 (ValueError: mining data generation changed)。开始挖掘前弹窗
+  // 建议暂时关闭实时; 挂起的 payload 非空即弹窗打开。
+  const { data: prefs } = usePreferences()
+  const realtimeToggle = useToggleRealtimeQuotes()
+  const realtimeOn = !!prefs?.realtime_quotes_enabled
+  const [pendingMining, setPendingMining] = useState<MiningRequestV1 | null>(null)
+  const confirmBackdrop = useDialogBackdrop(() => setPendingMining(null), () => !realtimeToggle.isPending)
+  const submitMining = (payload: MiningRequestV1) => {
+    const params = new URLSearchParams(searchParams)
+    params.delete('run')
+    params.delete('candidate')
+    setSearchParams(params, { replace: true })
+    void startMining(payload).then(() => queryClient.invalidateQueries({ queryKey: QK.miningRuns }))
+  }
   const runFromUrl = searchParams.get('run') || ''
   const selectedCandidate = searchParams.get('candidate') || ''
 
@@ -491,11 +567,11 @@ export function MiningWorkbench() {
       max_finalists: maxFinalists!,
       force: draft.force,
     }
-    const params = new URLSearchParams(searchParams)
-    params.delete('run')
-    params.delete('candidate')
-    setSearchParams(params, { replace: true })
-    void startMining(payload).then(() => queryClient.invalidateQueries({ queryKey: QK.miningRuns }))
+    if (realtimeOn) {
+      setPendingMining(payload)
+      return
+    }
+    submitMining(payload)
   }
 
   const promote = useMutation({
@@ -630,13 +706,13 @@ export function MiningWorkbench() {
 
           <div className="sticky bottom-0 flex gap-2 bg-base/95 py-2">
             <button type="button" disabled={task.isPending || !draft.factorNames.length || (draft.strategyIds.length > 0 && strategyQuery.isLoading) || !validDateRange || availabilityQuery.isPending || availabilityQuery.isFetching || availabilityQuery.isError || !availabilityQuery.data?.eligible} onClick={runMining} className="inline-flex h-8 flex-1 items-center justify-center gap-1.5 rounded-btn bg-accent px-3 text-xs font-semibold text-white transition-opacity disabled:cursor-not-allowed disabled:opacity-50"><Play className="h-3.5 w-3.5" />开始挖掘</button>
-            {task.isPending && <button type="button" title="取消任务" disabled={task.cancelling} onClick={() => void cancelMining()} className="inline-flex h-8 w-9 items-center justify-center rounded-btn border border-danger/40 text-danger hover:bg-danger/10 disabled:opacity-50"><Square className="h-3.5 w-3.5" /></button>}
+            {task.isPending && <button type="button" title={task.runId ? '取消任务' : '因子筛选阶段不可取消，run 创建后可取消'} disabled={task.cancelling || !task.runId} onClick={() => void cancelMining()} className="inline-flex h-8 w-9 items-center justify-center rounded-btn border border-danger/40 text-danger hover:bg-danger/10 disabled:cursor-not-allowed disabled:opacity-50"><Square className="h-3.5 w-3.5" /></button>}
           </div>
 
           <section className="border-t border-border pt-3">
             <div className="mb-2 flex items-center justify-between"><span className="text-[10px] font-semibold text-secondary">最近运行</span><button type="button" title="刷新历史" onClick={() => void runsQuery.refetch()} className="text-muted hover:text-accent"><RefreshCw className={`h-3 w-3 ${runsQuery.isFetching ? 'animate-spin' : ''}`} /></button></div>
             <div className="max-h-40 space-y-1 overflow-y-auto">
-              {(runsQuery.data?.items ?? []).map(run => <button key={run.run_id} type="button" onClick={() => attachRun(run)} className={`flex w-full items-center gap-2 rounded-btn px-2 py-1.5 text-left hover:bg-elevated ${task.runId === run.run_id ? 'bg-accent/10' : ''}`}><span className={`h-1.5 w-1.5 shrink-0 rounded-full ${SUCCESS.has(run.status) ? 'bg-success' : ACTIVE.has(run.status) ? 'bg-accent' : 'bg-muted'}`} /><span className="min-w-0 flex-1 truncate font-mono text-[9px] text-secondary">{run.run_id}</span><span className="shrink-0 text-[9px] text-muted">{statusLabel(run.status)}</span></button>)}
+              {(runsQuery.data?.items ?? []).map(run => <button key={run.run_id} type="button" onClick={() => attachRun(run)} className={`flex w-full items-center gap-2 rounded-btn px-2 py-1.5 text-left hover:bg-elevated ${task.runId === run.run_id ? 'bg-accent/10' : ''}`}><span className={`h-1.5 w-1.5 shrink-0 rounded-full ${SUCCESS.has(run.status) ? 'bg-success' : ACTIVE.has(run.status) ? 'bg-accent' : 'bg-muted'}`} />{run.request?.auto && <span className="shrink-0 rounded-btn bg-accent/10 px-1 text-[8px] font-medium text-accent" title="自动挖掘（因子池由统计筛选生成）">自动</span>}<span className="min-w-0 flex-1 truncate font-mono text-[9px] text-secondary">{run.run_id}</span><span className="shrink-0 text-[9px] text-muted">{statusLabel(run.status)}</span></button>)}
               {runsQuery.isError && <div className="text-[9px] text-danger">运行历史加载失败</div>}
               {!runsQuery.isLoading && !runsQuery.isError && !(runsQuery.data?.items.length) && <div className="text-[9px] text-muted">暂无持久运行</div>}
             </div>
@@ -648,6 +724,7 @@ export function MiningWorkbench() {
 
       <section className="min-w-0 bg-surface xl:max-h-[calc(100vh-9rem)] xl:overflow-y-auto">
         <RunStatus run={task.run} progress={task.progress} error={task.error} reconnecting={task.reconnecting} />
+        {task.run?.request?.auto_screening && <AutoScreeningCard screening={task.run.request.auto_screening} />}
         {showingPrevious && <div className="border-b border-warning/30 bg-warning/5 px-3 py-1.5 text-[10px] text-warning">历史结果 · run {result?.run_id}。当前 run {task.runId} {task.isPending ? '仍在执行' : '未成功完成'}，以下内容仅供参考，候选操作已禁用。</div>}
 
         {!result ? (
@@ -712,6 +789,31 @@ export function MiningWorkbench() {
 
         {task.runId && <div className="flex items-center gap-1.5 border-t border-border px-3 py-2 text-[9px] text-muted"><Link2 className="h-3 w-3" />刷新后通过持久 run ID 自动重连；浏览器断开不会取消 worker。</div>}
       </section>
+
+      {/* 实时行情开启时的挖掘确认: 盘中 enriched 持续落盘会让排队任务开跑即
+          失败 (data generation changed), 建议先关实时再开始。 */}
+      {pendingMining && (
+        <div {...confirmBackdrop} className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+          <div onClick={e => e.stopPropagation()} className="w-full max-w-sm rounded-2xl border border-border bg-surface p-5 shadow-2xl">
+            <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
+              <AlertTriangle className="h-4 w-4 shrink-0 text-warning" />
+              实时行情已开启
+            </div>
+            <p className="mt-2 text-xs leading-5 text-secondary">
+              实时行情开启期间，盘中数据会持续落盘，挖掘任务可能在启动时因数据更新校验而失败（提示 mining data generation changed）。
+              建议先暂时关闭实时行情，任务启动后再重新开启。
+            </p>
+            <div className="mt-4 flex justify-end gap-2">
+              <button type="button" disabled={realtimeToggle.isPending} onClick={() => setPendingMining(null)} className="h-8 rounded-btn border border-border px-3 text-xs text-secondary hover:bg-elevated disabled:opacity-50">取消</button>
+              <button type="button" disabled={realtimeToggle.isPending} onClick={() => { const p = pendingMining; setPendingMining(null); if (p) submitMining(p) }} className="h-8 rounded-btn border border-border px-3 text-xs text-foreground hover:bg-elevated disabled:opacity-50">仍要开始</button>
+              <button type="button" disabled={realtimeToggle.isPending} onClick={() => { const p = pendingMining; if (!p) return; void realtimeToggle.mutateAsync(false).then(() => { setPendingMining(null); submitMining(p) }) }} className="inline-flex h-8 items-center gap-1.5 rounded-btn bg-accent px-3 text-xs font-semibold text-white hover:opacity-90 disabled:opacity-50">
+                {realtimeToggle.isPending ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
+                关闭实时并开始
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

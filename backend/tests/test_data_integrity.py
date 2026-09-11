@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import polars as pl
 import pytest
 
-from app.market_time import CN_TZ
+from app.market_time import CN_TZ, cn_today
 from app.services.data_integrity import (
     AUTO_REPAIR_MAX_LAG_DAYS,
     IntegrityIssue,
@@ -107,11 +107,155 @@ def test_final_snapshot_after_close_is_clean(tmp_path):
     assert scan_recent_integrity(tmp_path, today=TODAY) == []
 
 
+def test_zero_volume_live_residue_amid_batch_rows_is_clean(tmp_path):
+    """盘后 batch 已覆盖主体数据时, 单个停牌实时残留不能误判整个分区。"""
+    part = tmp_path / "kline_daily" / f"date={FRIDAY.isoformat()}"
+    part.mkdir(parents=True)
+    pl.DataFrame({
+        "symbol": ["600001.SH", "600002.SH", "600003.SH", "600004.SH"],
+        "date": [FRIDAY] * 4,
+        "open": [10.0, 9.8, 12.0, 8.0],
+        "high": [10.2, 9.8, 12.2, 8.1],
+        "low": [9.9, 9.8, 11.9, 7.9],
+        "close": [10.1, 9.8, 12.1, 8.0],
+        "volume": [1000.0, 0.0, 1200.0, 800.0],
+        "amount": [10100.0, 0.0, 14520.0, 6400.0],
+        "quote_ts": [None, _ts_ms(FRIDAY, time(9, 15)), None, None],
+    }).write_parquet(part / "part.parquet")
+    _write_daily_partition(tmp_path, "kline_daily", TODAY, _ts_ms(TODAY, time(10, 0)))
+
+    assert scan_recent_integrity(tmp_path, today=TODAY) == []
+
+
+def test_mostly_zero_preopen_rows_with_one_batch_row_is_flagged(tmp_path):
+    """少量 batch 行不能掩盖占主体的盘前实时快照。"""
+    part = tmp_path / "kline_daily" / f"date={FRIDAY.isoformat()}"
+    part.mkdir(parents=True)
+    preopen_ts = _ts_ms(FRIDAY, time(9, 15))
+    pl.DataFrame({
+        "symbol": ["600001.SH", "600002.SH", "600003.SH", "600004.SH"],
+        "date": [FRIDAY] * 4,
+        "open": [10.0, 20.0, 30.0, 40.0],
+        "high": [10.0, 20.0, 30.0, 40.1],
+        "low": [10.0, 20.0, 30.0, 39.9],
+        "close": [10.0, 20.0, 30.0, 40.0],
+        "volume": [0.0, 0.0, 0.0, 100.0],
+        "amount": [0.0, 0.0, 0.0, 4000.0],
+        "quote_ts": [preopen_ts, preopen_ts, preopen_ts, None],
+    }).write_parquet(part / "part.parquet")
+    _write_daily_partition(tmp_path, "kline_daily", TODAY, _ts_ms(TODAY, time(10, 0)))
+
+    issues = scan_recent_integrity(tmp_path, today=TODAY)
+    assert [(i.day, i.table, i.kind) for i in issues] == [
+        (FRIDAY, "kline_daily", "snapshot"),
+    ]
+
+
+def test_all_zero_preopen_live_partition_is_still_flagged(tmp_path):
+    """整分区都是盘前实时数据时仍须修复, 不能因零成交而放过。"""
+    part = tmp_path / "kline_daily" / f"date={FRIDAY.isoformat()}"
+    part.mkdir(parents=True)
+    pl.DataFrame({
+        "symbol": ["600001.SH", "600002.SH"],
+        "date": [FRIDAY, FRIDAY],
+        "open": [10.0, 20.0],
+        "high": [10.0, 20.0],
+        "low": [10.0, 20.0],
+        "close": [10.0, 20.0],
+        "volume": [0.0, 0.0],
+        "amount": [0.0, 0.0],
+        "quote_ts": [_ts_ms(FRIDAY, time(9, 15))] * 2,
+    }).write_parquet(part / "part.parquet")
+    _write_daily_partition(tmp_path, "kline_daily", TODAY, _ts_ms(TODAY, time(10, 0)))
+
+    issues = scan_recent_integrity(tmp_path, today=TODAY)
+    assert [(i.day, i.table, i.kind) for i in issues] == [
+        (FRIDAY, "kline_daily", "snapshot"),
+    ]
+
+
 def test_today_partition_is_never_flagged(tmp_path):
     # 今天的盘中 quote_ts 属正常实时更新
     _write_daily_partition(tmp_path, "kline_daily", FRIDAY, None)
     _write_daily_partition(tmp_path, "kline_daily", TODAY, _ts_ms(TODAY, time(9, 45)))
     assert scan_recent_integrity(tmp_path, today=TODAY) == []
+
+
+def test_realtime_daily_builder_drops_halted_rows_before_zero_fill():
+    from app.services.quote_service import QuoteService
+
+    result = QuoteService._build_daily([
+        {
+            "symbol": "600001.SH", "last_price": 10.0,
+            "open": 9.9, "high": 10.1, "low": 9.8,
+            "volume": 1000.0, "amount": 10000.0,
+            "timestamp": _ts_ms(cn_today(), time(10, 0)),
+        },
+        {
+            "symbol": "600002.SH", "last_price": 20.0,
+            "open": 0.0, "high": 0.0, "low": 0.0,
+            "volume": 0.0, "amount": 0.0,
+            "timestamp": _ts_ms(cn_today(), time(9, 15)),
+        },
+    ])
+
+    assert result["symbol"].to_list() == ["600001.SH"]
+
+
+def test_realtime_daily_builder_drops_stale_snapshot_rows():
+    """回归: 停牌股快照停留旧日, 不得复制成当日假蜡烛 (301266.SZ 2026-09-04)。
+
+    实时源对停牌标的返回停牌前最后一份快照 — OHLCV 全为旧日真实值, 仅
+    timestamp 停在旧日。这种记录不属于当日, 必须在落盘前按 quote_ts 过滤。
+    """
+    from app.services.quote_service import QuoteService
+
+    halted_since = cn_today() - timedelta(days=7)
+    result = QuoteService._build_daily([
+        {
+            "symbol": "600001.SH", "last_price": 10.0,
+            "open": 9.9, "high": 10.1, "low": 9.8,
+            "volume": 1000.0, "amount": 10000.0,
+            "timestamp": _ts_ms(cn_today(), time(15, 0)),
+        },
+        {
+            "symbol": "301266.SZ", "last_price": 24.97,
+            "open": 23.10, "high": 24.99, "low": 23.01,
+            "volume": 65038.0, "amount": 157796300.0,
+            "timestamp": _ts_ms(halted_since, time(15, 30)),
+        },
+    ])
+
+    assert result["symbol"].to_list() == ["600001.SH"]
+
+
+def test_realtime_daily_builder_keeps_rows_without_timestamp():
+    """无时间戳的源无法判断快照新旧, 维持原行为保留 (不因缺列误删)。"""
+    from app.services.quote_service import QuoteService
+
+    result = QuoteService._build_daily([
+        {
+            "symbol": "600003.SH", "last_price": 8.0,
+            "open": 7.9, "high": 8.1, "low": 7.8,
+            "volume": 500.0, "amount": 4000.0,
+        },
+    ])
+
+    assert result["symbol"].to_list() == ["600003.SH"]
+
+
+def test_halt_filter_drops_legacy_zero_volume_row_after_ohlc_fill():
+    from app.indicators.pipeline import filter_halt_days
+
+    result = filter_halt_days(pl.DataFrame({
+        "symbol": ["600001.SH", "600002.SH"],
+        "open": [10.0, 20.0],
+        "high": [10.2, 20.0],
+        "volume": [1000.0, 0.0],
+        "amount": [10100.0, 0.0],
+    }))
+
+    assert result["symbol"].to_list() == ["600001.SH"]
 
 
 def test_missing_tail_day_flagged(tmp_path):
@@ -227,14 +371,19 @@ def test_describe_and_issue_dataclass():
 # ── 开实时行情门禁 (钩子2) ──────────────────────────────────────────
 
 
-def _gate_state(tmp_path, quote_service, repo):
+def _gate_state(tmp_path, quote_service, repo, *, has_data=True):
     from types import SimpleNamespace
 
     return SimpleNamespace(
         app=SimpleNamespace(state=SimpleNamespace(
             quote_service=quote_service,
             depth_service=None,
-            repo=SimpleNamespace(store=SimpleNamespace(data_dir=tmp_path)),
+            repo=SimpleNamespace(
+                store=SimpleNamespace(data_dir=tmp_path),
+                # 首用门禁判据: 日K/enriched 最近日期 (None = 本地无数据)
+                latest_daily_date=lambda: date(2026, 8, 28) if has_data else None,
+                latest_enriched_date=lambda: None,
+            ),
             capabilities=None,
         ))
     )
@@ -270,8 +419,18 @@ def test_realtime_gate_blocks_on_snapshot_and_launches_repair(tmp_path, monkeypa
     from app.api import settings as settings_api
     from app.services import data_integrity
 
-    _write_daily_partition(tmp_path, "kline_daily", FRIDAY, _ts_ms(FRIDAY, time(11, 58)))
-    _write_daily_partition(tmp_path, "kline_daily", TODAY, _ts_ms(TODAY, time(10, 0)))
+    real_today = datetime.now(CN_TZ).date()
+    snapshot_day = real_today - timedelta(days=1)
+    while snapshot_day.weekday() >= 5:
+        snapshot_day -= timedelta(days=1)
+    _write_daily_partition(
+        tmp_path, "kline_daily", snapshot_day,
+        _ts_ms(snapshot_day, time(11, 58)),
+    )
+    _write_daily_partition(
+        tmp_path, "kline_daily", real_today,
+        _ts_ms(real_today, time(10, 0)),
+    )
 
     launched = []
     monkeypatch.setattr(
@@ -294,15 +453,46 @@ def test_realtime_gate_blocks_on_snapshot_and_launches_repair(tmp_path, monkeypa
     assert "盘中快照" in exc_info.value.detail
     assert "job-x" in exc_info.value.detail
     # 修复任务以最早坏日为起点, 且实时行情未被开启
-    assert launched == [(FRIDAY, "realtime_gate")]
+    assert launched == [(snapshot_day, "realtime_gate")]
     assert saved == {}
+
+
+def test_realtime_gate_blocks_when_no_local_data(tmp_path, monkeypatch):
+    """首用门禁: 日K/enriched 均无数据时禁止开启实时行情 (409 + 同步指引),
+    且不落偏好 (开关不生效)。"""
+    from fastapi import HTTPException
+
+    from app.api import settings as settings_api
+
+    saved = {}
+    monkeypatch.setattr(
+        "app.services.preferences.save", lambda payload: saved.update(payload),
+    )
+
+    qs = _QuoteServiceStub()
+    request = _gate_state(tmp_path, qs, repo=None, has_data=False)
+    req = settings_api.RealtimeQuotesPrefs(realtime_quotes_enabled=True)
+
+    with pytest.raises(HTTPException) as exc_info:
+        settings_api.update_realtime_quotes(req, request)
+
+    assert exc_info.value.status_code == 409
+    assert "同步" in exc_info.value.detail
+    assert saved == {}                       # 未开启
 
 
 def test_realtime_gate_allows_clean_data(tmp_path, monkeypatch):
     from app.api import settings as settings_api
 
-    _write_daily_partition(tmp_path, "kline_daily", FRIDAY, None)
-    _write_daily_partition(tmp_path, "kline_daily", TODAY, _ts_ms(TODAY, time(10, 0)))
+    real_today = datetime.now(CN_TZ).date()
+    previous_day = real_today - timedelta(days=1)
+    while previous_day.weekday() >= 5:
+        previous_day -= timedelta(days=1)
+    _write_daily_partition(tmp_path, "kline_daily", previous_day, None)
+    _write_daily_partition(
+        tmp_path, "kline_daily", real_today,
+        _ts_ms(real_today, time(10, 0)),
+    )
 
     saved = {}
     monkeypatch.setattr(
@@ -321,11 +511,15 @@ def test_realtime_gate_allows_clean_data(tmp_path, monkeypatch):
 def test_realtime_gate_ignores_old_issues_beyond_window(tmp_path, monkeypatch):
     from app.api import settings as settings_api
 
-    old_day = TODAY - timedelta(days=AUTO_REPAIR_MAX_LAG_DAYS + 1)
+    real_today = datetime.now(CN_TZ).date()
+    old_day = real_today - timedelta(days=AUTO_REPAIR_MAX_LAG_DAYS + 1)
     while old_day.weekday() >= 5:
         old_day -= timedelta(days=1)
     _write_daily_partition(tmp_path, "kline_daily", old_day, _ts_ms(old_day, time(11, 58)))
-    _write_daily_partition(tmp_path, "kline_daily", TODAY, _ts_ms(TODAY, time(10, 0)))
+    _write_daily_partition(
+        tmp_path, "kline_daily", real_today,
+        _ts_ms(real_today, time(10, 0)),
+    )
 
     saved = {}
     monkeypatch.setattr(
@@ -430,3 +624,40 @@ def test_pipeline_self_heals_snapshot_day(tmp_path, monkeypatch):
     )
     assert enriched_left == [f"date={yesterday.isoformat()}", f"date={today.isoformat()}"]
     assert result["enriched_days"] > 0
+
+
+def test_quotes_flush_partition_keeps_quote_ts_for_integrity_scan(tmp_path, monkeypatch):
+    """实时行情覆写当日分区必须写 quote_ts, 否则停机后自检漏判盘中快照。
+
+    盘中手动触发盘后管道时, "今天已有数据 → 实时行情覆写"分支会用
+    tf.quotes.get_by_universes 整分区覆写。若覆写不带 quote_ts, 停机后次日
+    启动自检把这份半日数据当成 batch 权威历史, 停机时刻的 close/volume 永久
+    留存并污染 lookback 指标 —— 正是本模块要拦的场景。
+    """
+    from app.services import kline_sync
+    from app.tickflow import client as tf_client
+    from app.tickflow.repository import DataStore, KlineRepository
+
+    snapshot_ms = _ts_ms(FRIDAY, time(11, 58))
+
+    class _FakeQuotes:
+        @staticmethod
+        def get_by_universes(universes):
+            return [{
+                "symbol": "600001.SH",
+                "open": 10.0, "high": 10.2, "low": 9.8, "last_price": 10.1,
+                "volume": 1000.0, "amount": 10100.0,
+                "timestamp": snapshot_ms,
+            }]
+
+    monkeypatch.setattr(tf_client, "get_client", lambda: SimpleNamespace(quotes=_FakeQuotes))
+    monkeypatch.setattr(kline_sync, "cn_today", lambda: FRIDAY)
+
+    repo = KlineRepository(DataStore(tmp_path))
+    assert kline_sync.sync_daily_by_quotes(repo) == 1
+
+    issues = scan_recent_integrity(tmp_path, today=TODAY)
+    assert [(i.day, i.table, i.kind) for i in issues] == [(FRIDAY, "kline_daily", "snapshot")]
+
+    part_dir = tmp_path / "kline_daily" / f"date={FRIDAY.isoformat()}"
+    assert _quote_ts_max_ms(part_dir) == snapshot_ms

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useCallback, useMemo } from 'react'
 import { chartTheme, getTheme, useTheme } from '@/lib/theme'
+import { fmtPct } from '@/lib/format'
 import * as echarts from 'echarts'
 import type { ECharts, EChartsOption } from 'echarts'
 
@@ -350,8 +351,8 @@ interface Props {
   linkedPrice?: number | null
   onDateClick?: (date: string) => void
   onPriceDoubleClick?: (price: number, currentPrice: number) => void
-  /** 默认可见蜡烛根数, 默认 60 */
-  visibleBars?: number
+  /** 默认可见蜡烛根数, 默认 60; 'all' = 初始适配显示全部返回数据 */
+  visibleBars?: number | 'all'
   /** 已激活的子图 key 列表 (含 vol, 按点击顺序) */
   activeIndicators?: string[]
   /** 成交量柱相对前 N 个交易日均量的显示设置 */
@@ -875,6 +876,7 @@ export function EChartsCandlestick({
   activeIndicators = [],
   volumeCompare = { enabled: true, days: 1 },
 }: Props) {
+  const hoverSurfaceRef = useRef<HTMLDivElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<ECharts | null>(null)
   const dataRef = useRef(data)
@@ -890,6 +892,8 @@ export function EChartsCandlestick({
   const infoIdxRef = useRef<number>(data.length - 1)
   const compactRef = useRef(false)
   const userZoomRef = useRef<{ start: number; end: number } | null>(null)
+  // 竖虚线(crosshair)是否可见: 控制信息栏「至今」字段的显隐。鼠标移出图表区即 false。
+  const hoverActiveRef = useRef(false)
 
   // 需要在闭包中访问最新值的变量 — 先声明占位，后面赋值
   const activeIndicatorsRef = useRef(activeIndicators)
@@ -946,11 +950,13 @@ export function EChartsCandlestick({
     return m
   }, [dates])
 
-  // 计算 dataZoom 初始范围
-  const initialZoom = useMemo(() => ({
-    start: Math.max(0, 100 - (visibleBars / Math.max(data.length, 1)) * 100),
-    end: 100,
-  }), [visibleBars, data.length])
+  // dataZoom 初始范围: 'all' = 显示整段数据, 否则取末尾 visibleBars 根
+  const initialZoom = useMemo(() => {
+    const start = visibleBars === 'all'
+      ? 0
+      : Math.max(0, 100 - (visibleBars / Math.max(data.length, 1)) * 100)
+    return { start, end: 100 }
+  }, [visibleBars, data.length])
 
   // ===== 信息栏 HTML 内容 (基于 infoIdxRef.current) =====
   const getInfoBarHTML = useCallback(() => {
@@ -969,7 +975,7 @@ export function EChartsCandlestick({
     const floatShares = stockInfo?.float_shares
     const turnoverRate = floatShares && d.volume ? (d.volume * 100 / floatShares * 100) : null
 
-    let html = `<div style="display:flex;align-items:center;gap:6px;padding:0 8px;font:11px 'JetBrains Mono',monospace;select:none;height:20px;flex-wrap:wrap">`
+    let html = `<div style="display:flex;align-items:center;gap:6px;padding:0 8px;font:11px 'JetBrains Mono',monospace;select:none;min-height:20px;flex-wrap:wrap">`
     html += `<span style="color:${CT().text}">${d.date}</span>`
     html += `<span style="color:${CT().text}">开</span>`
     html += `<span style="color:${d.open >= d.close ? THEME.bear : THEME.bull}">${d.open.toFixed(2)}</span>`
@@ -988,11 +994,25 @@ export function EChartsCandlestick({
       html += `<span style="color:${CT().text}">换手</span>`
       html += `<span style="color:${CT().text}">${turnoverRate.toFixed(2)}%</span>`
     }
+    // 至今: 仅当竖虚线(crosshair)在图上且鼠标悬停某根 K 线时显示。
+    // 最新价取最后一根K线收盘 (后端 _maybe_inject_live_candle 盘中注入实时价, 收盘后即最近收盘)。
+    // 基准取该K线昨收(前一日收盘), 与同花顺及全市场涨幅口径一致; 数据第一根K线无昨收则跳过。
+    if (hoverActiveRef.current && prev && Number.isFinite(prev.close) && prev.close > 0) {
+      const latestPrice = data[data.length - 1].close
+      if (Number.isFinite(latestPrice)) {
+        const sinceRatio = (latestPrice - prev.close) / prev.close
+        const sinceClr = sinceRatio >= 0 ? THEME.bull : THEME.bear
+        html += `<span style="color:${CT().text}">至今</span>`
+        html += `<span style="color:${sinceClr}">${fmtPct(sinceRatio)}</span>`
+        // 周期数: 从该K线(含)到最新一根K线共多少根; 悬停最后一根时为 1
+        html += `<span style="color:${CT().text}">周期 ${data.length - idx}</span>`
+      }
+    }
     html += `</div>`
 
     // 第二行: MA + BOLL
     if (showMA) {
-      html += `<div style="display:flex;align-items:center;gap:10px;padding:0 8px;font:11px 'JetBrains Mono',monospace;select:none;height:20px;flex-wrap:wrap">`
+      html += `<div style="display:flex;align-items:center;gap:10px;padding:0 8px;font:11px 'JetBrains Mono',monospace;select:none;min-height:20px;flex-wrap:wrap">`
       if (d.ma5 != null) html += `<span style="color:${THEME.ma5}">MA5:${Number(d.ma5).toFixed(2)}</span>`
       if (d.ma10 != null) html += `<span style="color:${THEME.ma10}">MA10:${Number(d.ma10).toFixed(2)}</span>`
       if (d.ma20 != null) html += `<span style="color:${THEME.ma20}">MA20:${Number(d.ma20).toFixed(2)}</span>`
@@ -1007,48 +1027,71 @@ export function EChartsCandlestick({
   }, [data, stockInfo, showMA, activeIndicators])
   getInfoBarHTMLRef.current = getInfoBarHTML
 
-  // data 变化时重置 infoIdx
+  // data/symbol 变化时重置 infoIdx:
+  // symbol(_symbol) 进依赖是必要的——预取切股到同长度邻股时 data.length 不变,
+  // 但悬停上下文来自上一只股票, 必须清掉 hoverActiveRef 以免「至今/周期」残留显示。
+  // (同一股的实时刷新 symbol 不变, 不触发, 悬停位置与「至今」保持实时)
   useEffect(() => {
     infoIdxRef.current = data.length - 1
     compactRef.current = false
     userZoomRef.current = null
-  }, [data.length])
+    // 新数据无悬停上下文, 隐藏「至今」; 下次鼠标移动时由 updateAxisPointer 重新置位
+    hoverActiveRef.current = false
+  }, [_symbol, data.length])
 
   // ===== 初始化 chart (只在 chartHeight 变化时重建) =====
   useEffect(() => {
     const el = containerRef.current
-    if (!el) return
+    const hoverEl = hoverSurfaceRef.current
+    if (!el || !hoverEl) return
 
     const chart = echarts.init(el, undefined, { renderer: 'canvas' })
     chartRef.current = chart
 
+    const updateHoverVisibility = (active: boolean) => {
+      if (active === hoverActiveRef.current) return
+      hoverActiveRef.current = active
+      const infoEl = infoBarRef.current
+      if (!infoEl) return
+      const html = getInfoBarHTMLRef.current()
+      if (html) infoEl.innerHTML = html
+    }
+
+    // The outer chart surface stays under the pointer when the info bar wraps and
+    // pushes the canvas down, so hover visibility cannot oscillate at that boundary.
+    const handlePointerEnter = () => updateHoverVisibility(true)
+    const handlePointerLeave = () => updateHoverVisibility(false)
+    hoverEl.addEventListener('mouseenter', handlePointerEnter)
+    hoverEl.addEventListener('mouseleave', handlePointerLeave)
+
     // 鼠标移动 → 只更新 ref + DOM，不触发 React re-render
-    // 设计原则: 找不到有效数据时保持上次显示，永远不清空信息栏
+    // 设计原则: 找不到有效数据时保持上次显示，永远不清空信息栏。
     chart.on('updateAxisPointer', (event: any) => {
       const axesInfo = event.axesInfo
-      if (!axesInfo) return // 鼠标移出图表区域，保持当前显示
-      for (const info of Object.values(axesInfo)) {
-        const val = (info as any)?.value
-        if (val == null) continue
-        const d = dataRef.current
-        const idx = typeof val === 'number' ? val : d.findIndex(x => x.date === val)
-        if (idx >= 0 && idx < d.length) {
-          if (infoIdxRef.current === idx) return
-          infoIdxRef.current = idx
-
-          // 直接更新信息栏 DOM (通过 ref 读取最新的生成函数)
-          const infoEl = infoBarRef.current
-          if (infoEl) {
-            const html = getInfoBarHTMLRef.current()
-            if (html) infoEl.innerHTML = html  // 只在有内容时更新
-          }
-
-          // 更新子图 graphic
-          triggerInfoBarUpdate()
-          return
+      const d = dataRef.current
+      // 竖虚线是否正落在某根有效 K 线上 (鼠标在图表数据区内)
+      let foundIdx = -1
+      if (axesInfo) {
+        for (const info of Object.values(axesInfo)) {
+          const val = (info as any)?.value
+          if (val == null) continue
+          const idx = typeof val === 'number' ? val : d.findIndex(x => x.date === val)
+          if (idx >= 0 && idx < d.length) { foundIdx = idx; break }
         }
       }
-      // 没有找到有效数据 — 不做任何操作，保持上次显示
+      if (foundIdx < 0) return
+      const idxChanged = infoIdxRef.current !== foundIdx
+      if (idxChanged) infoIdxRef.current = foundIdx
+      // 悬停 K 线变化 → 重绘一次信息栏; 显隐由外层图表区域 enter/leave 负责。
+      if (idxChanged) {
+        const infoEl = infoBarRef.current
+        if (infoEl) {
+          const html = getInfoBarHTMLRef.current()
+          if (html) infoEl.innerHTML = html  // 只在有内容时更新
+        }
+      }
+      // 更新子图 graphic (仅悬停 K 线变化时; 纯显隐切换不影响副图)
+      if (idxChanged) triggerInfoBarUpdate()
     })
 
     chart.on('click', (params: any) => {
@@ -1101,6 +1144,8 @@ export function EChartsCandlestick({
       chart.off('updateAxisPointer')
       chart.off('click')
       chart.off('dataZoom')
+      hoverEl.removeEventListener('mouseenter', handlePointerEnter)
+      hoverEl.removeEventListener('mouseleave', handlePointerLeave)
       chart.getZr().off('dblclick', handlePriceDoubleClick)
       ro.disconnect()
       chart.dispose()
@@ -1219,7 +1264,7 @@ export function EChartsCandlestick({
     if (!d) return ''
     const floatShares = stockInfo?.float_shares
     const turnoverRate = floatShares && d.volume ? (d.volume * 100 / floatShares * 100) : null
-    let html = `<div style="display:flex;align-items:center;gap:6px;padding:0 8px;font:11px 'JetBrains Mono',monospace;height:20px;flex-wrap:wrap">`
+    let html = `<div style="display:flex;align-items:center;gap:6px;padding:0 8px;font:11px 'JetBrains Mono',monospace;min-height:20px;flex-wrap:wrap">`
     html += `<span style="color:${CT().text}">${d.date}</span>`
     html += `<span style="color:${CT().text}">开</span>`
     html += `<span style="color:${d.open >= d.close ? THEME.bear : THEME.bull}">${d.open.toFixed(2)}</span>`
@@ -1242,7 +1287,7 @@ export function EChartsCandlestick({
     }
     html += `</div>`
     if (showMA) {
-      html += `<div style="display:flex;align-items:center;gap:10px;padding:0 8px;font:11px 'JetBrains Mono',monospace;height:20px;flex-wrap:wrap">`
+      html += `<div style="display:flex;align-items:center;gap:10px;padding:0 8px;font:11px 'JetBrains Mono',monospace;min-height:20px;flex-wrap:wrap">`
       if (d.ma5 != null) html += `<span style="color:${THEME.ma5}">MA5:${Number(d.ma5).toFixed(2)}</span>`
       if (d.ma10 != null) html += `<span style="color:${THEME.ma10}">MA10:${Number(d.ma10).toFixed(2)}</span>`
       if (d.ma20 != null) html += `<span style="color:${THEME.ma20}">MA20:${Number(d.ma20).toFixed(2)}</span>`
@@ -1257,7 +1302,7 @@ export function EChartsCandlestick({
   }, [])
 
   return (
-    <div className="w-full">
+    <div ref={hoverSurfaceRef} className="w-full">
       {/* 主图信息栏 — 内容由 JS 直接操作 innerHTML */}
       {showInfoBar && (
         <div ref={infoBarRef} style={{ backgroundColor: CT().infoBarBg }}

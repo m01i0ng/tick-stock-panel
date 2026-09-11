@@ -3,8 +3,8 @@
 能力 (capability) = 一个标准化数据集 (CONTRIBUTING「数据源插件化要求」):
 daily / adj_factor / realtime / minute / depth5 / financial (注册表顺序即设置页卡片顺序)。注册表集中声明每个
 能力的展示元数据、路由偏好字段与 TickFlow 档位要求, 前端设置页不再各自硬编码。
-depth5 目前仅 TickFlow 供 (插件数据集白名单未开放, 见 loader), 仍进矩阵是为了
-可用性门控诚实: 五档不可用时连板梯队封单/看板封单缺数据应有提示。
+depth5 与其他数据集一样可由插件声明并独立路由; 五档不可用时连板梯队封单/
+看板封单通过 usable 给出缺数据提示。
 
 build_capability_matrix 把注册表、插件/自定义源的能力声明 (datasets) 和当前
 路由偏好合并为一个矩阵, 供设置页一次拉全。当前偏好由 API 层注入
@@ -67,7 +67,6 @@ CAPABILITY_REGISTRY: list[dict] = [
         "field": "depth5_data_provider",
         "default": "tickflow",
         "tf_tier": "pro",
-        # 插件契约暂未开放 depth5 数据集 (loader 白名单), 当前仅 TickFlow 供
     },
     {
         "id": "financial",
@@ -81,11 +80,11 @@ CAPABILITY_REGISTRY: list[dict] = [
         "id": "full_minute",
         "label": "全量分钟",
         "desc": "盘中全市场当日分钟落盘 (冷启动全天 + 标的池增量)",
-        "field": None,
+        "field": "full_minute_data_provider",
         "default": "tickflow",
         "tf_tier": "expert",
-        # intraday.universe 能力 (TickFlow Expert 专有): 插件契约不开放此数据集,
-        # 生效源恒为 TickFlow — 不可路由, 无对应 provider 偏好字段
+        # TickFlow 侧需 Expert 档; 插件/自定义源声明 full_minute 数据集即可提供
+        # (插件实现 get_intraday_batch / 可选 get_intraday_latest, YAML 仅修复轮)
     },
 ]
 

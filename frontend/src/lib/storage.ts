@@ -44,6 +44,9 @@ export const storage = {
   /** 个股详情多日分时周期 */
   stockPreviewIntradayDays: kv<number>('stock_preview_intraday_days'),
 
+  /** 个股详情外链 URL 模板 (支持 {code}/{market}/{symbol}; 留空关闭) */
+  stockExternalTemplate: kv<string>('stock_external_template'),
+
   /** 策略结果列表列配置 */
   screenerResultColumns: kv<unknown[]>('screener_result_columns'),
 
@@ -61,6 +64,9 @@ export const storage = {
 
   /** 策略结果列表分时图显示状态 */
   screenerIntraday:     kv<boolean>('screener_showIntraday'),
+
+  /** 策略结果列表"策略"列标签展开状态 (false=默认收起: 每行首个+计数, 行内可单独展开) */
+  screenerStrategyTags: kv<boolean>('screener_strategyTagsExpanded'),
 
   /** 自选列表板块筛选 */
   watchlistBoardFilter: kv<string[]>('watchlist_boardFilter'),
