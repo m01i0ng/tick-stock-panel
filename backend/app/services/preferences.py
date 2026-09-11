@@ -78,6 +78,18 @@ def get_realtime_quotes_enabled() -> bool:
     return load().get("realtime_quotes_enabled", False)
 
 
+def get_realtime_watchlist_symbols() -> list[str]:
+    """自选实时标的代码列表。默认空列表。"""
+    return list(load().get("realtime_watchlist_symbols", []))
+
+
+def set_realtime_watchlist_symbols(symbols: list[str]) -> list[str]:
+    """保存自选实时标的代码列表。"""
+    cleaned = [str(s).strip() for s in symbols if str(s).strip()]
+    save({"realtime_watchlist_symbols": cleaned})
+    return cleaned
+
+
 def get_watchlist_groups_in_nav() -> bool:
     """自选分组是否显示在侧边栏（可展开二级子菜单）。默认 False。"""
     return load().get("watchlist_groups_in_nav", False)

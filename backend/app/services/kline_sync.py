@@ -1005,6 +1005,7 @@ def fetch_intraday_monitor_batch(
 
     tf = get_client()
     frames: list[pl.DataFrame] = []
+    want_bare = any("." not in str(s) for s in symbols)
     try:
         if source == "intraday_batch":
             limits = capset.limits(Cap.INTRADAY_BATCH) if capset else None
@@ -1014,19 +1015,19 @@ def fetch_intraday_monitor_batch(
                 batch_size=limits.batch if limits and limits.batch else 100,
             )
             df = _normalize_minute(_compact_klines_to_df(raw))
-            if not df.is_empty():
+            if not df.is_empty() and want_bare:
                 df = df.with_columns(pl.col("symbol").str.replace(r"\.[A-Za-z]+$", ""))
         elif source == "intraday_single":
             tf_sym = _to_tickflow_symbol(symbols[0])
             raw = tf.klines.intraday(tf_sym, count=300, as_dataframe=False)
             df = _normalize_minute(_compact_klines_to_df(raw, default_symbol=symbols[0]))
-            if not df.is_empty():
+            if not df.is_empty() and want_bare:
                 df = df.with_columns(pl.col("symbol").str.replace(r"\.[A-Za-z]+$", ""))
         elif source == "minute_single":
             tf_sym = _to_tickflow_symbol(symbols[0])
             raw = tf.klines.get(tf_sym, period="1m", count=300, as_dataframe=False)
             df = _normalize_minute(_compact_klines_to_df(raw, default_symbol=symbols[0]))
-            if not df.is_empty():
+            if not df.is_empty() and want_bare:
                 df = df.with_columns(pl.col("symbol").str.replace(r"\.[A-Za-z]+$", ""))
         else:
             df = pl.DataFrame()
