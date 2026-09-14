@@ -29,6 +29,8 @@ export function ExtDataPullPanel({ config, onSaved }: {
   const [timeWindowStart, setTimeWindowStart] = useState(pull?.time_window_start ?? '')
   const [timeWindowEnd, setTimeWindowEnd] = useState(pull?.time_window_end ?? '')
   const [dateParam, setDateParam] = useState(pull?.date_param ?? '')
+  const [dateFormat, setDateFormat] = useState(pull?.date_format ?? 'iso')
+  const [timeField, setTimeField] = useState(pull?.time_field ?? '')
   const [enabled, setEnabled] = useState(pull?.enabled ?? false)
 
   // 接口鉴权: 方式入 pull 配置; Key 本体只存后端 secrets.json
@@ -83,6 +85,8 @@ export function ExtDataPullPanel({ config, onSaved }: {
       time_window_start: timeWindowStart || null,
       time_window_end: timeWindowEnd || null,
       date_param: dateParam.trim() || null,
+      date_format: dateFormat,
+      time_field: timeField.trim() || null,
     }
   }
 
@@ -330,9 +334,33 @@ export function ExtDataPullPanel({ config, onSaved }: {
 
         <div>
           <div className="text-[10px] text-muted mb-1">日期参数名 (接口支持按日查询时填, 如 date)</div>
+          <div className="flex items-center gap-1.5">
+            <input
+              value={dateParam} onChange={e => setDateParam(e.target.value)}
+              placeholder="date · 留空=接口只有当日快照"
+              className="flex-1 min-w-0 rounded-btn border border-border bg-elevated px-2 py-1.5 text-[10px] font-mono text-foreground placeholder:text-muted/40"
+            />
+            <select
+              aria-label="日期参数值格式"
+              value={dateFormat} onChange={e => setDateFormat(e.target.value)}
+              disabled={!dateParam.trim()}
+              title="日期参数值的序列化格式; 时间戳 = 该交易日北京时间 00:00:00"
+              className="shrink-0 rounded-btn border border-border bg-elevated px-1.5 py-1.5 text-[10px] text-secondary outline-none focus:border-accent disabled:opacity-40"
+            >
+              <option value="iso">YYYY-MM-DD</option>
+              <option value="compact">YYYYMMDD</option>
+              <option value="ts_s">秒时间戳</option>
+              <option value="ts_ms">毫秒时间戳</option>
+            </select>
+          </div>
+        </div>
+
+        <div>
+          <div className="text-[10px] text-muted mb-1">时间字段 (日内多行数据填, 如 ts · 竞价/分时快照)</div>
           <input
-            value={dateParam} onChange={e => setDateParam(e.target.value)}
-            placeholder="date · 留空=接口只有当日快照"
+            value={timeField} onChange={e => setTimeField(e.target.value)}
+            placeholder="ts · 留空=每日快照表 (同代码一天一行)"
+            title="配置后同一代码允许一天多行, 按代码+时间列去重"
             className="w-full rounded-btn border border-border bg-elevated px-2 py-1.5 text-[10px] font-mono text-foreground placeholder:text-muted/40"
           />
         </div>

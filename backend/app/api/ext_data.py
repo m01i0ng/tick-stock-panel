@@ -97,6 +97,11 @@ class PullConfigReq(BaseModel):
     time_window_end: str | None = None     # "HH:MM", None=不限
     # 接口按日查询的参数名 (如 "date"): 配置后支持历史回补, 且当日拉取也带日期参数
     date_param: str | None = Field(None, min_length=1, max_length=16, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    # 日期参数值的格式: iso/compact/ts_s/ts_ms (时间戳=该交易日北京时间 00:00:00), 缺省 iso
+    date_format: str = "iso"
+    # 日内序列表时间列名 (字段映射后的列名, 如 "ts"): 配置后同 symbol 允许多行,
+    # 按 [symbol, time_field] 去重; 留空 = 每日快照表 (按 symbol 去重)
+    time_field: str | None = Field(None, max_length=32)
     # 鉴权方式; 请求中缺省 (None) = 保留现有配置, {"type":"none"} = 关闭鉴权
     auth: PullAuthReq | None = None
 
@@ -453,6 +458,10 @@ def list_rows(
     data_dir = _data_dir(request)
     df, active_date = _read_ext_dataframe(config, data_dir, snapshot_date)
     df = _with_instrument_name(df, data_dir)
+    # 日内序列表: 按时间列升序, 保证分页/截断取到的是最早的盘
+    tf = config.pull.time_field if config.pull else None
+    if tf and tf in df.columns:
+        df = df.sort(tf)
     requested = [c.strip() for c in (columns or "").split(",") if c.strip()]
     if requested:
         keep = [c for c in ["symbol", "code", "name", *requested] if c in df.columns]
@@ -589,6 +598,9 @@ def _prev_daily_close(data_dir: Path, target_date: str) -> pl.DataFrame | None:
     return (
         df.with_columns(_bare_symbol_expr().alias("_bare"))
         .select([pl.col("_bare"), pl.col("close").cast(pl.Float64).alias("prev_close")])
+        # 前收 <= 0 / 非有限视为缺失 (否则 close/ref 为 inf, 整个响应 JSON 渲染 500),
+        # 缺失时由调用方退化为当日首根有效分钟 close
+        .filter(pl.col("prev_close").is_finite() & (pl.col("prev_close") > 0))
         .unique(subset=["_bare"], keep="last")
     )
 
@@ -637,7 +649,10 @@ def _dimension_intraday_compute(
     except Exception as exc:  # noqa: BLE001
         logger.warning("dimension-intraday read minute partition failed: %s", exc)
         return {"status": "no_data", "reason": "minute_schema", "date": target, "points": []}
-    bars = bars.drop_nulls(subset=["datetime", "close"])
+    # close <= 0 / 非有限的分钟行无效: 作基准时 pct 为 inf, 作分子时是 -100% 假跌幅
+    bars = bars.drop_nulls(subset=["datetime", "close"]).filter(
+        pl.col("close").cast(pl.Float64).is_finite() & (pl.col("close") > 0)
+    )
     if bars.is_empty():
         return {"status": "no_data", "reason": "minute_empty", "date": target, "points": []}
     bars = bars.with_columns(_bare_symbol_expr().alias("_bare"))
@@ -876,6 +891,8 @@ def configure_pull(request: Request, config_id: str, body: PullConfigReq):
         time_window_start=body.time_window_start,
         time_window_end=body.time_window_end,
         date_param=body.date_param,
+        date_format=body.date_format,
+        time_field=body.time_field,
         auth=body.auth.model_dump() if body.auth else (old_pull.auth if old_pull else None),
         last_run=old_pull.last_run if old_pull else None,
         last_status=old_pull.last_status if old_pull else None,

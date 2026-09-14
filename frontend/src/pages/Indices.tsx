@@ -134,7 +134,6 @@ export function Indices() {
     queryKey: QK.indexMinute(selectedSymbol, selectedDate ?? ''),
     queryFn: () => api.indexMinute(selectedSymbol, selectedDate ?? undefined),
     enabled: !!selectedSymbol && !!selectedDate && hasMinuteCap && isDailyView,
-    placeholderData: (prev) => prev,
   })
 
   const syncDaily = useMutation({
@@ -180,7 +179,9 @@ export function Indices() {
     })) : []
   ), [activeChan, showChan])
   const selectedInfo = topRows.find(r => r.symbol === selectedSymbol) || daily.data?.index_info
-  const minuteRows: MinuteKlineRow[] = minute.data?.rows ?? []
+  const minuteRows: MinuteKlineRow[] = minute.data?.symbol === selectedSymbol
+    && minute.data?.date === selectedDate && daily.data?.symbol === selectedSymbol
+    ? minute.data.rows : []
   const selectedIdx = selectedDate ? chartRows.findIndex(r => r.date === selectedDate) : -1
   const prevClose = selectedIdx > 0
     ? chartRows[selectedIdx - 1].close
@@ -341,7 +342,10 @@ export function Indices() {
                   showMarkers={false}
                   symbol={selectedSymbol}
                   linkedPrice={linkedPrice}
-                  onDateClick={isDailyView ? setSelectedDate : undefined}
+                  onDateClick={isDailyView ? (date) => {
+                    setSelectedDate(date)
+                    setLinkedPrice(null)
+                  } : undefined}
                   visibleBars={isMinuteChan ? 120 : chanLevel === 'monthly' ? 36 : chanLevel === 'weekly' ? 52 : 48}
                   activeIndicators={isDailyView ? ['vol', 'macd'] : ['vol']}
                   polylines={chanLines}
@@ -388,6 +392,7 @@ export function Indices() {
                     )}
                     {minuteRows.length > 0 && (
                       <EChartsIntraday
+                        key={`${selectedSymbol}:${selectedDate}`}
                         data={minuteRows}
                         height={620}
                         prevClose={prevClose}
