@@ -721,7 +721,8 @@ def compute_limit_signals(
         instrument_needs.add("name")
     if "turnover_rate" in want:
         instrument_needs.add("float_shares")
-    if need_up:
+    if need_price_limits:
+        # limit_up 哨兵值 (>= 10000) 同时标记跌停侧「无涨跌停限制」, 只算跌停信号时也要带上
         instrument_needs.add("limit_up")
     if need_down:
         instrument_needs.add("limit_down")
@@ -828,7 +829,16 @@ def compute_limit_signals(
         ).then(pl.col("limit_down")).otherwise(pl.col("_theoretical_limit_down"))
     else:
         effective_limit_down = pl.col("_theoretical_limit_down")
-    effective_exprs: list[pl.Expr] = []
+    # 维表 limit_up 为哨兵值 = 当日无涨跌停限制 (注册制新股上市前 5 日), 与实时路径
+    # _compute_limit_signals_today 同口径: 涨停/跌停/炸板/翘板一律不成立, 不回退理论价
+    no_price_limit = pl.lit(False)
+    if "limit_up" in df.columns:
+        no_price_limit = (
+            authoritative_date
+            & pl.col("limit_up").is_not_null()
+            & (pl.col("limit_up") >= _SENTINEL)
+        )
+    effective_exprs: list[pl.Expr] = [no_price_limit.fill_null(False).alias("_no_price_limit")]
     if need_up:
         effective_exprs.append(effective_limit_up.alias("_effective_limit_up"))
     if need_down:
@@ -838,7 +848,8 @@ def compute_limit_signals(
     # ── signal_limit_up ──
     if need_up:
         df = df.with_columns(
-        pl.when(
+        pl.when(pl.col("_no_price_limit")).then(False)
+        .when(
             pl.col("_prev_raw_close").is_not_null()
             & (pl.col("_prev_raw_close") > 0)
             & (pl.col("raw_close") > 0)
@@ -874,7 +885,8 @@ def compute_limit_signals(
     # ── signal_limit_down ──
     if need_down:
         df = df.with_columns(
-        pl.when(
+        pl.when(pl.col("_no_price_limit")).then(False)
+        .when(
             pl.col("_prev_raw_close").is_not_null()
             & (pl.col("_prev_raw_close") > 0)
             & (pl.col("raw_close") > 0)
@@ -911,7 +923,8 @@ def compute_limit_signals(
     # 条件: 当日最低价曾触及跌停价 + 最终没有跌停 + 收阳
     if "signal_limit_down_recovery" in want:
         df = df.with_columns(
-        pl.when(
+        pl.when(pl.col("_no_price_limit")).then(False)
+        .when(
             pl.col("_prev_raw_close").is_not_null()
             & (pl.col("_prev_raw_close") > 0)
             & (pl.col("raw_low") > 0)
@@ -927,7 +940,8 @@ def compute_limit_signals(
     # 条件: 最高价曾触及涨停价 + 最终没有封住涨停
     if "signal_broken_limit_up" in want:
         df = df.with_columns(
-        pl.when(
+        pl.when(pl.col("_no_price_limit")).then(False)
+        .when(
             pl.col("_prev_raw_close").is_not_null()
             & (pl.col("_prev_raw_close") > 0)
             & (pl.col("raw_high") > 0)
@@ -941,7 +955,7 @@ def compute_limit_signals(
     # 清理临时列 + JOIN 引入的 instruments 列 (不存入 enriched)
     cleanup = ["_prev_raw_close", "_limit_pct",
                "_theoretical_limit_up", "_theoretical_limit_down",
-               "_effective_limit_up", "_effective_limit_down",
+               "_effective_limit_up", "_effective_limit_down", "_no_price_limit",
                "_grp_up", "_grp_down", "_instrument_as_of"]
     if "_is_st" in df.columns:
         cleanup.append("_is_st")
@@ -1994,7 +2008,8 @@ def compute_enriched_today(
     boll_sum = pl.col("_boll_partial_sum") + pl.col("close")
     boll_sq_sum = pl.col("_boll_partial_sq_sum") + pl.col("close") ** 2
     boll_ma = boll_sum / 20
-    boll_var = boll_sq_sum / 20 - boll_ma ** 2
+    # 样本方差 (ddof=1), 与全量 rolling_std(20) / 回测矩阵 ddof=1 同口径
+    boll_var = (boll_sq_sum - boll_sum ** 2 / 20) / 19
     boll_std = pl.when(boll_var > 0).then(boll_var.sqrt()).otherwise(0.0)
     df = df.with_columns([
         (boll_ma + 2 * boll_std).alias("boll_upper"),
@@ -2056,14 +2071,14 @@ def compute_enriched_today(
         ((pl.col("volume") * time_factor) / vol_ma5_prev).alias("vol_ratio_5d"),
     ])
 
-    # ---- 极值 60 日 ----
+    # ---- 极值 60 日 (收盘价口径, 与全量 close.rolling_max/min(60) 一致) ----
     df = df.with_columns([
         pl.when(has_history_state)
-          .then(pl.max_horizontal(pl.col("_high_59d"), pl.col("high")))
+          .then(pl.max_horizontal(pl.col("_high_59d"), pl.col("close")))
           .otherwise(None)
           .alias("high_60d"),
         pl.when(has_history_state)
-          .then(pl.min_horizontal(pl.col("_low_59d"), pl.col("low")))
+          .then(pl.min_horizontal(pl.col("_low_59d"), pl.col("close")))
           .otherwise(None)
           .alias("low_60d"),
     ])
@@ -2088,14 +2103,32 @@ def compute_enriched_today(
     today_ret = pl.col("close") / pl.col("prev_close") - 1
     total_sum = pl.col("_vol_19d_pct_sum").fill_null(0.0) + today_ret
     total_sq_sum = pl.col("_vol_19d_pct_sq_sum").fill_null(0.0) + today_ret ** 2
-    vol_mean = total_sum / 20
-    vol_var = total_sq_sum / 20 - vol_mean ** 2
+    # 样本方差 (ddof=1), 与全量 _daily_pct.rolling_std(20) / 回测矩阵 ddof=1 同口径
+    vol_var = (total_sq_sum - total_sum ** 2 / 20) / 19
     df = df.with_columns(
         pl.when(has_history_state & (vol_var > 0))
           .then(vol_var.sqrt() * (252 ** 0.5))
           .otherwise(None)
           .alias("annual_vol_20d"),
     )
+
+    # ---- 窗口不满置空 ----
+    # live_agg 的部分和 / 极值 / N 日前收盘用 tail(N) 取, 历史 K 线不足 N 根 (次新股) 时
+    # 取到的是残缺窗口; 全量 rolling_*(N) / shift(N) 窗口不满为空, 按窗口内实际根数同口径置空。
+    min_history_bars = {
+        "ma5": 4, "ma10": 9, "ma20": 19, "ma30": 29, "ma60": 59,
+        "vol_ma5": 4, "vol_ma10": 9, "vol_ratio_5d": 5,
+        "boll_upper": 19, "boll_lower": 19, "high_60d": 59, "low_60d": 59,
+        "momentum_3d": 3, "momentum_5d": 5, "momentum_10d": 10,
+        "momentum_20d": 20, "momentum_30d": 30, "momentum_60d": 60,
+        "annual_vol_20d": 20,
+    }
+    if "_window_len" in df.columns:
+        df = df.with_columns([
+            pl.when(pl.col("_window_len") >= need).then(pl.col(column)).otherwise(None).alias(column)
+            for column, need in min_history_bars.items()
+            if column in df.columns
+        ])
 
     # ---- 信号 (需要昨天的指标值判断交叉) ----
     if not prev_enriched.is_empty():

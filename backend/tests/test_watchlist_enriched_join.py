@@ -264,3 +264,88 @@ def test_watchlist_enriched_index_branch(monkeypatch):
     assert rows["510300.SH"]["asset_type"] == "etf"
     # as_of == min(三类缓存日期)
     assert res["as_of"] == "2026-07-23"
+
+
+def _quote_df(rows):
+    """rows: [(symbol, close, prev_close, volume, open, high, low), ...]"""
+    return pl.DataFrame(
+        [{"symbol": s, "close": c, "prev_close": pc, "volume": v,
+          "open": o, "high": h, "low": lo, "amount": 1e9, "change_pct": 1.0}
+         for s, c, pc, v, o, h, lo in rows],
+        schema_overrides={k: pl.Float64 for k in
+                          ("close", "prev_close", "volume", "open", "high", "low",
+                           "amount", "change_pct")},
+    )
+
+
+def test_watchlist_enriched_limit_prices_and_quote_cols(monkeypatch):
+    """昨收/成交量透传; 股票行涨跌停价按板块现算 (划断后 ST=10%), ETF 行置 null。
+
+    涨停价口径: prev_close x (1+pct) 整数分半进位 (polars_limit_price)。
+      - 600519.SH 主板 10%: 1800.0 → 涨停 1980.00 / 跌停 1620.00
+      - 300001.SZ 创业 20%: 10.0 → 12.00 / 8.00
+      - 600029.SH 主板 ST (2026-07-08 ≥ 划断日) 10%: 10.0 → 11.00 / 9.00
+    """
+    monkeypatch.setattr(wl_api.watchlist, "list_symbols",
+                        lambda: [{"symbol": s} for s in
+                                 ("600519.SH", "300001.SZ", "600029.SH", "510300.SH")])
+    repo = _FakeRepo(
+        enriched_df=_quote_df([
+            ("600519.SH", 1900.0, 1800.0, 123456.0, 1810.0, 1950.0, 1799.0),
+            ("300001.SZ", 10.5, 10.0, 88_000.0, 10.1, 10.8, 9.9),
+            ("600029.SH", 10.6, 10.0, 55_000.0, 10.0, 10.9, 9.7),
+        ]),
+        enriched_date="2026-07-08",
+        etf_df=_quote_df([("510300.SH", 4.1, 4.0, 900_000.0, 4.0, 4.2, 3.9)]),
+        etf_date="2026-07-08",
+        etf_set={"510300.SH"},
+        name_map={
+            "600519.SH": "贵州茅台", "300001.SZ": "特锐德", "600029.SH": "ST 南航",
+            "510300.SH": "沪深300ETF",
+        },
+    )
+
+    res = wl_api.watchlist_enriched(_make_request(repo), ext_columns=None)
+    rows = {r["symbol"]: r for r in res["rows"]}
+
+    # 昨收/成交量 透传 (此前被 _WATCHLIST_COLS 裁掉)
+    row = rows["600519.SH"]
+    assert row["prev_close"] == 1800.0
+    assert row["volume"] == 123456.0
+    assert row["open"] == 1810.0 and row["high"] == 1950.0 and row["low"] == 1799.0
+
+    # 股票行涨跌停价
+    assert rows["600519.SH"]["limit_up_price"] == 1980.0
+    assert rows["600519.SH"]["limit_down_price"] == 1620.0
+    assert rows["300001.SZ"]["limit_up_price"] == 12.0
+    assert rows["300001.SZ"]["limit_down_price"] == 8.0
+    # 主板 ST 在 2026-07-06 划断后恢复 10%
+    assert rows["600029.SH"]["limit_up_price"] == 11.0
+    assert rows["600029.SH"]["limit_down_price"] == 9.0
+
+    # ETF 行: prev_close/volume 正常透传, 涨跌停价置 null
+    etf = rows["510300.SH"]
+    assert etf["prev_close"] == 4.0 and etf["volume"] == 900_000.0
+    assert etf["limit_up_price"] is None
+    assert etf["limit_down_price"] is None
+
+
+def test_watchlist_enriched_limit_prices_legacy_st(monkeypatch):
+    """数据日在 2026-07-06 划断之前: 主板 ST 涨跌幅为 5% 老规则, 非 ST 不受影响。"""
+    monkeypatch.setattr(wl_api.watchlist, "list_symbols",
+                        lambda: [{"symbol": s} for s in ("600029.SH", "600519.SH")])
+    repo = _FakeRepo(
+        enriched_df=_quote_df([
+            ("600029.SH", 10.2, 10.0, 66_000.0, 10.0, 10.4, 9.8),
+            ("600519.SH", 1900.0, 1800.0, 123456.0, 1810.0, 1950.0, 1799.0),
+        ]),
+        enriched_date="2026-07-01",
+        name_map={"600029.SH": "ST 南航", "600519.SH": "贵州茅台"},
+    )
+
+    res = wl_api.watchlist_enriched(_make_request(repo), ext_columns=None)
+    rows = {r["symbol"]: r for r in res["rows"]}
+
+    assert rows["600029.SH"]["limit_up_price"] == 10.5
+    assert rows["600029.SH"]["limit_down_price"] == 9.5
+    assert rows["600519.SH"]["limit_up_price"] == 1980.0

@@ -25,9 +25,26 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * 把浏览器 fetch 抛出的裸网络错误文案翻译成可操作的提示。
+ * 各浏览器文案不同: Chrome "Failed to fetch" / Safari "network error" / "Load failed"。
+ * 典型根因: 后端等 AI 首包期间流式连接被代理/网关按空闲超时切断, 或 AI 服务繁忙。
+ */
+export function friendlyStreamError(message: string | undefined | null): string {
+  if (!message) return ''
+  if (/failed to fetch|network error|load failed|networkerror/i.test(message)) {
+    return '网络连接中断: 通常是 AI 服务繁忙, 或代理/网关超时切断了长连接, 请重试'
+  }
+  return message
+}
+
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
 /** 同步计算型接口 (回测/筛选等) 的放宽超时: 合法耗时可能远超轮询类接口。 */
 const COMPUTE_REQUEST_TIMEOUT_MS = 300_000
+/** 扩展数据拉取类长请求: 跟随后端配置的单次超时 (timeoutSeconds, 默认 30s) + 10s 解析/写盘缓冲。
+ *  浏览器端 fetch 默认 30s abort 会先于后端超时触发, 大响应接口 (如全量集合竞价
+ *  /day, 后端超时 120s) 必须把这层同步放宽。 */
+const extPullTimeoutMs = (timeoutSeconds?: number) => (timeoutSeconds ?? 30) * 1000 + 10_000
 
 async function request<T>(path: string, init?: RequestOptions): Promise<T> {
   const { quiet, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, ...fetchInit } = init ?? {}
@@ -835,6 +852,7 @@ export type StrategyBuildStreamEvent =
   | { type: 'delta'; content: string }
   | ({ type: 'result' } & StrategyBuildResult)
   | { type: 'error'; message: string }
+  | { type: 'ping' }
 
 export interface StrategyCodeSaveResult {
   ok: boolean
@@ -3118,6 +3136,7 @@ export const api = {
     date_param?: string | null;
     time_field?: string | null;
     auth?: ExtPullAuth;
+    timeout_seconds?: number;
   }) =>
     request<{ status: string; pull: PullConfig }>(
       `/api/ext-data/${id}/pull`,
@@ -3137,23 +3156,24 @@ export const api = {
       { method: 'PUT', body: JSON.stringify({ key }) },
     ),
 
-  extDataPullTest: (id: string) =>
+  extDataPullTest: (id: string, timeoutSeconds?: number) =>
     request<{ status: string; total_rows: number; preview: Record<string, unknown>[]; has_symbol: boolean }>(
       `/api/ext-data/${id}/pull/test`,
-      { method: 'POST' },
+      { method: 'POST', timeoutMs: extPullTimeoutMs(timeoutSeconds) },
     ),
 
-  extDataPullRun: (id: string) =>
+  extDataPullRun: (id: string, timeoutSeconds?: number) =>
     request<{ status: string; rows: number; date: string }>(
       `/api/ext-data/${id}/pull/run`,
-      { method: 'POST' },
+      { method: 'POST', timeoutMs: extPullTimeoutMs(timeoutSeconds) },
     ),
 
-  /** 历史回补: 按本地交易日逐日拉取写入 timeseries 分区 (需 pull.date_param) */
-  extDataBackfill: (id: string, start: string, end: string) =>
+  /** 历史回补: 按本地交易日逐日拉取写入 timeseries 分区 (需 pull.date_param)。
+   *  timeoutMs 由调用方按 天数×单日超时 估算传入 (服务端逐日串行, 总耗时随天数线性)。 */
+  extDataBackfill: (id: string, start: string, end: string, timeoutMs?: number) =>
     request<ExtDataBackfillResult>(
       `/api/ext-data/${encodeURIComponent(id)}/backfill?start=${start}&end=${end}`,
-      { method: 'POST' },
+      { method: 'POST', timeoutMs: timeoutMs ?? 600_000 },
     ),
 
   // 内置预设 (概念/行业) 手动获取数据: 走结构转换, 保证 schema 一致
@@ -3176,6 +3196,7 @@ export const api = {
     request<ExtDataDetectUrlResult>('/api/ext-data/detect-url', {
       method: 'POST',
       body: JSON.stringify(body),
+      timeoutMs: extPullTimeoutMs(body.timeout_seconds),
     }),
 
   extDataFixSymbol: (id: string) =>
@@ -3246,7 +3267,7 @@ export const api = {
    * 用 ReadableStream 解析(而非 SSE EventSource),支持 POST body 且更简单。
    */
   async *financialAnalyzeStream(symbol: string, focus?: string): AsyncGenerator<{
-    type: 'meta' | 'delta' | 'error' | 'done'
+    type: 'meta' | 'delta' | 'error' | 'done' | 'ping'
     symbol?: string
     summary?: string
     periods?: number
@@ -3317,7 +3338,7 @@ export const api = {
    * meta 里额外带 levels(关键价位)供图表回放。
    */
   async *stockAnalyzeStream(symbol: string, focus?: string): AsyncGenerator<{
-    type: 'meta' | 'delta' | 'error' | 'done'
+    type: 'meta' | 'delta' | 'error' | 'done' | 'ping'
     symbol?: string
     summary?: string
     levels?: Record<LevelType, PriceLevel[]>
@@ -3392,7 +3413,7 @@ export const api = {
    * meta 里带 as_of / emotion_score / emotion_label / summary,供前端先渲染信号灯。
    */
   async *reviewStream(asOf?: string, focus?: string): AsyncGenerator<{
-    type: 'meta' | 'delta' | 'error' | 'done'
+    type: 'meta' | 'delta' | 'error' | 'done' | 'ping'
     as_of?: string
     emotion_score?: number
     emotion_label?: string
@@ -3436,7 +3457,7 @@ export const api = {
 
   /** AI 概念轮动分析 — 流式 NDJSON。 */
   async *rotationAnalyzeStream(days: number, focus?: string, kind?: 'concept' | 'industry', level?: number): AsyncGenerator<{
-    type: 'meta' | 'delta' | 'error' | 'done'
+    type: 'meta' | 'delta' | 'error' | 'done' | 'ping'
     days?: number
     summary?: string
     content?: string
@@ -3893,6 +3914,8 @@ export interface PullConfig {
   /** 日内序列表时间列名 (如 "ts"): 配置后同 symbol 允许多行 (按 symbol+时间列去重), 用于集合竞价等多盘数据 */
   time_field?: string | null
   auth?: ExtPullAuth | null
+  /** 单次拉取请求超时 (秒), 默认 30 */
+  timeout_seconds?: number
 }
 
 export interface ExtDataBackfillResult {
@@ -3912,6 +3935,8 @@ export interface ExtDataDetectUrlRequest {
   body?: string
   response_path?: string
   field_map?: Record<string, string>
+  /** 探测超时 (秒), 默认 30 */
+  timeout_seconds?: number
 }
 
 export interface ExtDataDetectUrlResult {

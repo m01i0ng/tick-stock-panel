@@ -580,3 +580,38 @@ def test_series_matrix_aligns_with_timeline_and_sectors(repo):
         values = [matrix[name][col] for name in series["sectors"] if matrix[name][col] is not None]
         assert values
         assert max(values) == pytest.approx(point["leader_pct"], abs=1e-4)
+
+
+def test_rank_reference_counts_trading_minutes_across_lunch(tmp_path):
+    """对照窗口按交易时间回看 1 小时, 午休不计: 13:10 的对照桶是 10:40
+    (往前 60 个交易分钟), 不是只隔 1 个交易分钟的 11:30。
+    A 早盘领涨, 11:00 起 B 反超并保持到午后 → 13:10 相对 1 个交易小时前 B 切入、A 退潮。"""
+    _reset_caches()
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    morning = [(h, m) for h in (9, 10, 11) for m in range(0, 60, 5) if (9, 35) <= (h, m) <= (11, 30)]
+    stamps = [datetime.fromisoformat(f"{DAY}T{h:02d}:{m:02d}:00") for h, m in [*morning, (13, 5), (13, 10)]]
+    rows = []
+    for ts in stamps:
+        b_ahead = (ts.hour, ts.minute) >= (11, 0)
+        for sym in SYMS_A:
+            rows.append({"symbol": sym, "datetime": ts, "close": 101.0 if b_ahead else 102.0})
+        for sym in SYMS_B:
+            rows.append({"symbol": sym, "datetime": ts, "close": 103.0 if b_ahead else 100.5})
+    (data_dir / "kline_minute" / f"date={DAY}").mkdir(parents=True)
+    pl.DataFrame(rows).write_parquet(data_dir / "kline_minute" / f"date={DAY}" / "part.parquet")
+    _write_prev_daily(data_dir)
+    _write_concept_ext(data_dir)
+    repo = SimpleNamespace(store=SimpleNamespace(data_dir=data_dir))
+
+    result = sector_rotation.build_sector_rotation(repo, kind="concept", bucket_minutes=5)
+    _reset_caches()
+    assert result["status"] == "ok"
+    assert result["as_of"] == "13:10"
+    sectors = {item["name"]: item for item in result["sectors"]}
+    a, b = sectors["A题材"], sectors["B题材"]
+    # 对照桶 10:40: A +2.0% 领涨, B +0.5%
+    assert b["pct_prev"] == pytest.approx(0.005, abs=1e-4)
+    assert a["pct_prev"] == pytest.approx(0.02, abs=1e-4)
+    assert b["rank_prev"] == 2 and b["rank_change"] == 1
+    assert a["rank_prev"] == 1 and a["rank_change"] == -1

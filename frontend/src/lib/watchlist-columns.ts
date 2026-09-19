@@ -30,8 +30,15 @@ export const BUILTIN_COLUMNS: ColumnConfig[] = [
   { id: 'builtin:pct', source: { type: 'builtin', key: 'pct' }, label: '涨跌幅', visible: true, align: 'center' },
   { id: 'builtin:change_amount', source: { type: 'builtin', key: 'change_amount' }, label: '涨跌额', visible: false, align: 'center' },
   { id: 'builtin:amplitude', source: { type: 'builtin', key: 'amplitude' }, label: '振幅', visible: false, align: 'center' },
+  { id: 'builtin:open', source: { type: 'builtin', key: 'open' }, label: '今开', visible: false, align: 'center' },
+  { id: 'builtin:high', source: { type: 'builtin', key: 'high' }, label: '最高', visible: false, align: 'center' },
+  { id: 'builtin:low', source: { type: 'builtin', key: 'low' }, label: '最低', visible: false, align: 'center' },
+  { id: 'builtin:prev_close', source: { type: 'builtin', key: 'prev_close' }, label: '昨收', visible: false, align: 'center' },
+  { id: 'builtin:limit_up_price', source: { type: 'builtin', key: 'limit_up_price' }, label: '涨停价', visible: false, align: 'center' },
+  { id: 'builtin:limit_down_price', source: { type: 'builtin', key: 'limit_down_price' }, label: '跌停价', visible: false, align: 'center' },
   // 成交
   { id: 'builtin:turnover', source: { type: 'builtin', key: 'turnover' }, label: '换手率', visible: true, align: 'center' },
+  { id: 'builtin:volume', source: { type: 'builtin', key: 'volume' }, label: '成交量', visible: false, align: 'center' },
   { id: 'builtin:amount', source: { type: 'builtin', key: 'amount' }, label: '成交额', visible: false, align: 'center' },
   { id: 'builtin:float_val', source: { type: 'builtin', key: 'float_val' }, label: '流通值', visible: false, align: 'center' },
   { id: 'builtin:vol_ratio', source: { type: 'builtin', key: 'vol_ratio' }, label: '量比', visible: true, align: 'center' },
@@ -86,8 +93,8 @@ export const BUILTIN_COLUMNS: ColumnConfig[] = [
 ]
 
 export const COLUMN_GROUPS: ColumnGroup[] = [
-  { id: 'price', label: '价格', icon: '💰', keys: ['price', 'pct', 'change_amount', 'amplitude'] },
-  { id: 'volume', label: '成交', icon: '📊', keys: ['turnover', 'amount', 'float_val', 'vol_ratio', 'annual_vol'] },
+  { id: 'price', label: '价格', icon: '💰', keys: ['price', 'pct', 'change_amount', 'amplitude', 'open', 'high', 'low', 'prev_close', 'limit_up_price', 'limit_down_price'] },
+  { id: 'volume', label: '成交', icon: '📊', keys: ['turnover', 'volume', 'amount', 'float_val', 'vol_ratio', 'annual_vol'] },
   { id: 'ma', label: '均线', icon: '📈', keys: ['ma5', 'ma10', 'ma20', 'ma60'] },
   { id: 'range', label: '区间', icon: '📏', keys: ['high_60d', 'low_60d'] },
   { id: 'tech', label: '技术指标', icon: '🔬', keys: ['rsi6', 'rsi14', 'rsi24', 'macd_dif', 'macd_dea', 'macd_hist', 'kdj_k', 'kdj_d', 'kdj_j', 'boll_upper', 'boll_lower', 'atr14', 'vol_ma5', 'vol_ma10'] },

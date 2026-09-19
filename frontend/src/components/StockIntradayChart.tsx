@@ -5,12 +5,14 @@ import { api, type MinuteKlineRow } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
 import { klineMinuteQueryOptions, minuteRefetchInterval } from '@/lib/kline'
 import { EChartsIntraday } from '@/components/EChartsIntraday'
+import type { DailySummary } from '@/lib/intraday-chart'
 
 interface Props {
   symbol: string
   date: string | null
   height?: number
   prevClose?: number
+  dailySummary?: DailySummary
   className?: string
   onPriceHover?: (price: number | null) => void
   onPriceDoubleClick?: (price: number, currentPrice: number) => void
@@ -25,6 +27,7 @@ export function StockIntradayChart({
   date,
   height = 520,
   prevClose,
+  dailySummary,
   className,
   onPriceHover,
   onPriceDoubleClick,
@@ -125,7 +128,8 @@ export function StockIntradayChart({
         <EChartsIntraday
           data={minuteRows}
           height={height}
-          prevClose={prevClose}
+          prevClose={minute.data?.prev_close ?? prevClose}
+          dailySummary={dailySummary}
           date={date}
           priceLimit={minute.data?.price_limit ?? undefined}
           onPriceHover={onPriceHover}

@@ -13,6 +13,11 @@ from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel
 
 from app.db_safe import is_valid_ext_ident, quote_ident
+from app.price_limits import (
+    polars_is_risk_warning_name,
+    polars_limit_price,
+    polars_price_limit_pct,
+)
 from app.services import watchlist
 from app.services.watchlist_csv import import_watchlist_codes, import_watchlist_csv
 from app.services.watchlist_ocr import import_watchlist_image
@@ -352,7 +357,8 @@ def clear_all():
 
 # 自选页需要的列
 _WATCHLIST_COLS = [
-    "symbol", "close", "open", "high", "low", "change_pct", "change_amount", "amount",
+    "symbol", "close", "open", "high", "low", "prev_close", "volume",
+    "change_pct", "change_amount", "amount",
     "turnover_rate",
     "amplitude", "annual_vol_20d",
     "vol_ratio_5d",
@@ -462,6 +468,33 @@ def watchlist_enriched(
     # 选择内置需要的列
     keep = [c for c in _WATCHLIST_COLS + ["name", "float_shares", "asset_type"] if c in df.columns]
     df = df.select(keep)
+
+    # 涨跌停价 (交易所整数分半进位口径, 仅股票): prev_close/名称已在行上, 对自选的
+    # 几十~几百行向量化现算为亚毫秒级, 不写回 enriched 存储。ETF (跨境/债券 5% 等)
+    # 与指数的涨跌幅规则不在 price_limits 覆盖内, 置 null 由前端渲染 "—"。
+    as_of_date = as_of if isinstance(as_of, date) else None
+    if as_of_date is None and as_of:
+        try:
+            as_of_date = date.fromisoformat(str(as_of)[:10])
+        except ValueError:
+            as_of_date = None
+    if {"symbol", "prev_close", "name", "asset_type"}.issubset(df.columns) and as_of_date is not None:
+        pct = polars_price_limit_pct(
+            pl.col("symbol"),
+            pl.lit(as_of_date),
+            polars_is_risk_warning_name(pl.col("name")),
+        )
+        stock_with_prev = (pl.col("asset_type") == "stock") & pl.col("prev_close").is_not_null()
+        df = df.with_columns(
+            pl.when(stock_with_prev)
+            .then(polars_limit_price(pl.col("prev_close"), pct, up=True))
+            .otherwise(None)
+            .alias("limit_up_price"),
+            pl.when(stock_with_prev)
+            .then(polars_limit_price(pl.col("prev_close"), pct, up=False))
+            .otherwise(None)
+            .alias("limit_down_price"),
+        )
 
     # 动态 JOIN 扩展数据表
     ext_specs = _parse_ext_columns(ext_columns) if ext_columns else []

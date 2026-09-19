@@ -72,6 +72,8 @@ class MatcherConfig:
     # 分钟K精确成交: 开启后, 信号触发日的成交价用当日分钟K优化
     # (有参考线→穿越价, 无参考线→VWAP)。数据缺失时降级为日K口径。
     minute_fill: bool = False
+    # 回测资产类型: 分钟K按资产类型分开存储, 精确成交据此路由分钟分区 (不凭代码格式猜测)。
+    asset_type: str = "stock"
 
     def __post_init__(self) -> None:
         # 解析最终口径: 优先 entry_fill/exit_fill, 否则回退到 matching (向后兼容)。
@@ -879,7 +881,7 @@ class BacktestEngine:
             dates = {matrix.timestamp_labels[int(t)][:10] for t in trigger_times}
             symbols = {matrix.symbols[int(a)] for a in trigger_assets}
             if dates and symbols:
-                loaded = self._load_minute_for_fills(self.repo, list(symbols), dates, "stock")
+                loaded = self._load_minute_for_fills(self.repo, list(symbols), dates, config.asset_type)
                 minute_cache = {key: value for key, value in loaded.items() if value is not None and len(value) > 0}
 
         def _count(key: str) -> None:
@@ -1791,12 +1793,8 @@ class BacktestEngine:
             trigger_dates = {matrix.timestamp_labels[int(t)][:10] for t in trigger_times}
             trigger_symbols = {matrix.symbols[int(a)] for a in trigger_assets}
             if trigger_dates and trigger_symbols:
-                asset_type = "etf" if all(
-                    symbol.endswith(".SH") and symbol.startswith("5")
-                    for symbol in list(trigger_symbols)[:5]
-                ) else "stock"
                 loaded = self._load_minute_for_fills(
-                    self.repo, list(trigger_symbols), trigger_dates, asset_type,
+                    self.repo, list(trigger_symbols), trigger_dates, config.asset_type,
                 )
                 minute_cache = {key: value for key, value in loaded.items() if value is not None and len(value) > 0}
 

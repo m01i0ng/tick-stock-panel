@@ -71,6 +71,22 @@ def enriched_dirname(asset_type: str) -> str:
     return "kline_etf_enriched" if asset_type == "etf" else "kline_daily_enriched"
 
 
+# 盘中递推状态的最长窗口 (交易日): MA60 部分和 tail(59)、60 日动量 tail(60)
+_LIVE_AGG_WINDOW_BARS = 60
+
+
+def _live_agg_window_start(dates: pl.Series, latest: date, calendar_start: date) -> date:
+    """盘中递推历史窗口起点: 自然日起点与「最近 60 个交易日」起点取较早者。
+
+    自然日 90 天通常含 62~65 个交易日, 但春节/国庆长假前后只有 57~59 个,
+    tail(59)/tail(60) 会取到残缺窗口 (与 get_enriched_history 按交易日计数同理)。
+    """
+    trading = dates.filter(dates <= latest).unique().sort()
+    if trading.len() >= _LIVE_AGG_WINDOW_BARS:
+        return min(calendar_start, trading[-_LIVE_AGG_WINDOW_BARS])
+    return calendar_start
+
+
 def _last_available_rows(df: pl.DataFrame, cutoff: date) -> pl.DataFrame:
     """从已按 symbol/date 排序的数据中取每只标的最后一条有效状态。"""
     if df.is_empty():
@@ -751,6 +767,8 @@ class KlineRepository:
         started = time.perf_counter()
         logger.info("live agg build start: latest=%s", latest)
         start_60d = latest - timedelta(days=90)  # 日历90天 ≈ 60个交易日
+        # EMA12/26、RSI 递推状态的暖机来源; None = 与窗口切片 df_hist 同源 (降级路径)
+        ewm_history: pl.DataFrame | None = None
 
         # 优先使用已有的历史缓存 (避免重复 scan_parquet + compute_indicators)
         if self._enriched_history_cache is not None and not self._enriched_history_cache.is_empty():
@@ -765,8 +783,9 @@ class KlineRepository:
                 needed = [c for c in base_cols if c in hist_all.columns]
                 step = time.perf_counter()
                 logger.info("live agg step start: slice history cache")
+                window_start = _live_agg_window_start(hist_all["date"], latest, start_60d)
                 df_hist = hist_all.select(needed).filter(
-                    (pl.col("date") >= start_60d) & (pl.col("date") <= latest)
+                    (pl.col("date") >= window_start) & (pl.col("date") <= latest)
                 ).sort(["symbol", "date"])
                 logger.info("live agg step done: slice history cache rows=%d (%.2fs)", len(df_hist), time.perf_counter() - step)
 
@@ -784,6 +803,9 @@ class KlineRepository:
                     hist_all.select("date", *existing_state), latest,
                 )
                 agg_a = state_source.select(existing_state)
+                # ema5~ema60 / macd_dea 等状态取自完整历史缓存; _ema12/_ema26 与 RSI 也必须
+                # 同源暖机, 只用 90 天窗口递推会与 macd_dea、盘后全量口径不一致
+                ewm_history = hist_all.select("symbol", "date", "close")
             else:
                 df_hist = pl.DataFrame()
                 agg_a = pl.DataFrame()
@@ -803,11 +825,13 @@ class KlineRepository:
             logger.info("live agg build skipped: empty state (%.2fs)", time.perf_counter() - started)
             return
 
+        ewm_source = df_hist if ewm_history is None else ewm_history
+
         # 单独计算 _ema12 / _ema26 (compute_indicators 内部会 drop 掉)
         step = time.perf_counter()
         logger.info("live agg step start: ema state")
         df_ema = _last_available_rows(
-            df_hist.sort(["symbol", "date"]).with_columns([
+            ewm_source.sort(["symbol", "date"]).with_columns([
                 pl.col("close").ewm_mean(alpha=_ema_alpha(12), adjust=False).over("symbol").alias("_ema12"),
                 pl.col("close").ewm_mean(alpha=_ema_alpha(26), adjust=False).over("symbol").alias("_ema26"),
             ]).select("symbol", "date", "_ema12", "_ema26"),
@@ -820,7 +844,7 @@ class KlineRepository:
         # 单独计算 RSI 状态列 (compute_indicators 内部会 drop 掉)
         step = time.perf_counter()
         logger.info("live agg step start: rsi state")
-        df_rsi_base = df_hist.sort(["symbol", "date"]).with_columns(
+        df_rsi_base = ewm_source.sort(["symbol", "date"]).with_columns(
             pl.col("close").diff().over("symbol").alias("_daily_delta")
         )
         gain = pl.when(pl.col("_daily_delta") > 0).then(pl.col("_daily_delta")).otherwise(0.0)
@@ -917,8 +941,9 @@ class KlineRepository:
                 pl.col("close").tail(19).sum().alias("_boll_partial_sum"),
                 (pl.col("close").tail(19) ** 2).sum().alias("_boll_partial_sq_sum"),
 
-                pl.col("high").tail(59).max().alias("_high_59d"),
-                pl.col("low").tail(59).min().alias("_low_59d"),
+                # 60 日极值为收盘价口径 (与 compute_indicators / 回测矩阵 high_60d 一致)
+                pl.col("close").tail(59).max().alias("_high_59d"),
+                pl.col("close").tail(59).min().alias("_low_59d"),
 
                 # 异动偏离 deviate_3d 用 (与 5d/10d/30d 同语义: 尾部第 N 个收盘)
                 pl.col("close").tail(3).first().alias("_close_3d_ago"),
@@ -936,7 +961,9 @@ class KlineRepository:
                 pl.col("low").tail(8).min().alias("_kdj_8d_low"),
                 pl.col("high").tail(8).max().alias("_kdj_8d_high"),
 
-                pl.col("close").tail(59).len().alias("_window_len"),
+                # 窗口内实际 K 线根数 (≤ 窗口天数): compute_enriched_today 据此把
+                # 历史不足的窗口指标置空, 与全量 rolling(窗口满才出值) 同口径
+                pl.len().alias("_window_len"),
             ])
         )
 
@@ -963,11 +990,14 @@ class KlineRepository:
 
     def _build_live_agg_from_parquet(self, latest: date, start_60d: date) -> tuple[pl.DataFrame, pl.DataFrame]:
         """降级路径: 从 parquet 读取数据并计算指标 (当 _enriched_history_cache 不可用时)。"""
+        from datetime import timedelta
+
         from app.indicators.pipeline import compute_indicators
 
+        # 多读一段自然日, 再按交易日计数确定窗口起点 (长假前后 90 个自然日不足 60 个交易日)
         lf = (
             scan_enriched_parquet(self._enriched_glob)
-            .filter(pl.col("date") >= start_60d)
+            .filter(pl.col("date") >= start_60d - timedelta(days=60))
             .filter(pl.col("date") <= latest)
             .sort(["symbol", "date"])
         )
@@ -980,6 +1010,8 @@ class KlineRepository:
 
         if df_hist.is_empty():
             return df_hist, pl.DataFrame()
+        window_start = _live_agg_window_start(df_hist["date"], latest, start_60d)
+        df_hist = df_hist.filter(pl.col("date") >= window_start)
 
         df_with_indicators = compute_indicators(df_hist)
 
@@ -1190,7 +1222,8 @@ class KlineRepository:
         # 按交易日计数裁剪: 从数据里实际存在的交易日序列取最后 lookback_days 个交易日。
         # 不能用 timedelta(days=N) (自然日), 否则周末/节假日会让窗口只有 ~N×5/7 个交易日,
         # 导致 filter_history 策略的滚动窗口/行号差(_gap)漏算, 与回测结果不一致。
-        trading_dates = cache["date"].unique().sort()
+        # 只数目标日及之前的交易日: 历史日期选股时缓存里还有更晚的交易日
+        trading_dates = cache["date"].filter(cache["date"] <= target_date).unique().sort()
         if len(trading_dates) > lookback_days:
             lookback_start = trading_dates[-(lookback_days + 1)]
         else:

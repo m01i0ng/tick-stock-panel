@@ -16,7 +16,7 @@ import polars as pl
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, Field
 
-from app.market_time import CN_TZ
+from app.market_time import CN_TZ, cn_today
 from app.services.ext_data import (
     ExtConfig,
     ExtConfigStore,
@@ -104,6 +104,8 @@ class PullConfigReq(BaseModel):
     time_field: str | None = Field(None, max_length=32)
     # 鉴权方式; 请求中缺省 (None) = 保留现有配置, {"type":"none"} = 关闭鉴权
     auth: PullAuthReq | None = None
+    # 单次拉取请求超时 (秒), 默认 30 与历史行为一致; 大响应接口可调高
+    timeout_seconds: int = Field(30, ge=5, le=300)
 
 
 class ApiKeyReq(BaseModel):
@@ -119,6 +121,9 @@ class DetectUrlReq(BaseModel):
     body: str | None = None
     response_path: str = ""
     field_map: dict[str, str] | None = None
+    # 探测超时; 与 PullConfig.timeout_seconds 同口径 (默认 30 与历史行为一致),
+    # 大响应接口 (如全量集合竞价 /day ~77s) 探测时需要更高超时
+    timeout_seconds: int = Field(30, ge=5, le=300)
 
 
 # ---------------------------------------------------------------------------
@@ -823,8 +828,9 @@ async def upload_data(
     keep = [c for c in df.columns if c in all_config_cols]
     df = df.select(keep)
 
-    # 解析快照日期
-    snap = date.fromisoformat(snapshot_date) if snapshot_date else date.today()
+    # 解析快照日期: 非法值 400 (与 /rows 同一校验); 缺省按北京日期落盘,
+    # 服务器时区不能决定分区归属 (UTC 容器北京 08:00 前会写进前一天)
+    snap = date.fromisoformat(_partition_date(snapshot_date)) if snapshot_date else cn_today()
 
     rows = write_ext_parquet(df, config, _data_dir(request), snapshot_date=snap)
 
@@ -856,7 +862,8 @@ def ingest_data(request: Request, config_id: str, body: IngestReq):
         if missing:
             raise HTTPException(400, f"第 {i + 1} 行缺少字段: {', '.join(sorted(missing))}")
 
-    snap = date.fromisoformat(body.date) if body.date else date.today()
+    # 同 /upload: 非法日期 400, 缺省按北京日期落盘
+    snap = date.fromisoformat(_partition_date(body.date)) if body.date else cn_today()
 
     rows_written = rows_to_parquet(body.rows, config, _data_dir(request), snapshot_date=snap)
 
@@ -894,6 +901,7 @@ def configure_pull(request: Request, config_id: str, body: PullConfigReq):
         date_format=body.date_format,
         time_field=body.time_field,
         auth=body.auth.model_dump() if body.auth else (old_pull.auth if old_pull else None),
+        timeout_seconds=body.timeout_seconds,
         last_run=old_pull.last_run if old_pull else None,
         last_status=old_pull.last_status if old_pull else None,
         last_message=old_pull.last_message if old_pull else None,
@@ -1142,7 +1150,7 @@ async def detect_url(body: DetectUrlReq):
         raise HTTPException(400, "仅支持 GET / POST")
 
     try:
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=body.timeout_seconds, follow_redirects=True) as client:
             headers = body.headers or {}
             kwargs: dict = {"headers": headers}
             if method == "POST" and body.body:

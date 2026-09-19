@@ -9,7 +9,7 @@
  * 财务率类用 fmtPct、kdj 用 toFixed(1)、vol_ma 用 fmtBigNum 等。
  */
 import type { ReactNode } from 'react'
-import { fmtPrice, fmtPct, fmtBigNum, priceColorClass } from '@/lib/format'
+import { fmtPrice, fmtPct, fmtBigNum, fmtVolume, priceColorClass } from '@/lib/format'
 import type { ColumnConfig } from '@/lib/list-columns'
 import { NUM_CELL_CLASS } from '@/lib/stock-table'
 
@@ -65,9 +65,20 @@ export function renderBuiltinDataCell(r: any, col: ColumnConfig): ReactNode | nu
       return <td key={col.id} className={`${numCls} ${priceColorClass(r.change_amount)}`}>{r.change_amount != null ? fmtPrice(r.change_amount) : '—'}</td>
     case 'amplitude':
       return <td key={col.id} className={numCls}>{r.amplitude != null ? `${(r.amplitude * 100).toFixed(2)}%` : '—'}</td>
+    case 'open':         return <td key={col.id} className={numCls}>{fmtMaybePrice(r.open)}</td>
+    case 'high':         return <td key={col.id} className={numCls}>{fmtMaybePrice(r.high)}</td>
+    case 'low':          return <td key={col.id} className={numCls}>{fmtMaybePrice(r.low)}</td>
+    case 'prev_close':   return <td key={col.id} className={numCls}>{fmtMaybePrice(r.prev_close)}</td>
+    // 涨跌停价 (仅股票有值, ETF/指数后端置 null); A 股口径红涨绿跌
+    case 'limit_up_price':
+      return <td key={col.id} className={`${numCls} ${r.limit_up_price != null ? 'text-danger' : ''}`}>{r.limit_up_price != null ? fmtPrice(r.limit_up_price) : '—'}</td>
+    case 'limit_down_price':
+      return <td key={col.id} className={`${numCls} ${r.limit_down_price != null ? 'text-bear' : ''}`}>{r.limit_down_price != null ? fmtPrice(r.limit_down_price) : '—'}</td>
     // 成交
     case 'turnover':
       return <td key={col.id} className={numCls}>{r.turnover_rate != null ? `${Number(r.turnover_rate).toFixed(2)}%` : '—'}</td>
+    case 'volume':
+      return <td key={col.id} className={`${numCls} text-secondary`}>{r.volume != null ? fmtVolume(r.volume) : '—'}</td>
     case 'amount':
       return <td key={col.id} className={`${numCls} text-secondary`}>{fmtBigNum(r.amount)}</td>
     case 'float_val':

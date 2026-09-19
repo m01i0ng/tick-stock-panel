@@ -172,6 +172,7 @@ export function StockPanel({
   }, [showIntraday, selectedDate, rows])
 
   const selectedIdx = selectedDate ? rows.findIndex(r => r.date === selectedDate) : -1
+  const selectedRow = selectedIdx >= 0 ? rows[selectedIdx] : undefined
   const prevClose = selectedIdx > 0
     ? rows[selectedIdx - 1].close
     : rows.length >= 2
@@ -233,6 +234,7 @@ export function StockPanel({
               date={selectedDate}
               height={height}
               prevClose={prevClose}
+              dailySummary={selectedRow}
               onPriceHover={setLinkedPrice}
               onPriceDoubleClick={onPriceDoubleClick}
               currentPrice={rows[rows.length - 1]?.close}

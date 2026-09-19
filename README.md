@@ -19,7 +19,7 @@
 
 **自托管、零运维的 A 股「选股 + 监控 + 回测」量化工作台**
 
-`多数据源能力路由` · `分钟级策略执行` · `全时段异动监控` · `AI 辅助研究`
+`多数据源能力路由` · `分钟级策略执行` · `全时段异动监控` · `AI 对话助手`
 
 <a href="https://trendshift.io/repositories/64327?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-64327" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/64327" alt="shy3130%2Ftick-stock-panel | Trendshift" width="250" height="55"/></a>
 <a href="https://trendshift.io/repositories/64327?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-64327" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/64327/daily?language=TypeScript" alt="shy3130%2Ftick-stock-panel | Trendshift" width="250" height="55"/></a>
@@ -52,6 +52,7 @@
 | 数据源绑死,换一家要重写整套拉数代码 | **能力路由矩阵**:6 类数据集按源能力独立路由,随时换源,指标与回测口径不变 |
 | 选股、回测、监控各用一套工具,口径对不上 | 全站统一 **enriched 数据口径**:选股 → 回测 → 监控 → 复盘一条链 |
 | 盘中异动靠人盯盘,错过就是错过 | **竞价/盘中/偏移**全时段异动 + 实时弹窗、语音播报、飞书推送 |
+| 想查个数据要在几个页面之间来回点 | **AI 对话助手**:一句话问出全站数据,取数过程逐条可见、可展开核对 |
 | 付费终端贵、云端平台数据出不了本地 | **自托管**:Docker 单容器,数据全部落在本地 Parquet,零运维 |
 
 ## ✨ 核心功能
@@ -168,9 +169,14 @@
 - **扩展分析** (动态菜单) — 把任意第三方/扩展数据字段配成一级菜单,与内置数据同台分析
 - **设置** Settings — 数据源与能力检测(能力路由矩阵、档位徽章)、AI 接口、实时监控、扩展页面、菜单与系统设置
 
+**🤖 AI 助手**
+- **AI 对话助手** — 悬浮球 / 侧栏 AI 徽标旁入口 / ⌘K 呼出; 18 个只读工具覆盖个股·大盘·板块·自选·持仓·信号·策略·因子, 逐字流式输出 + 工具调用足迹卡(参数与耗时可展开核对), 每条回答附风险与数据口径提示; 完全解耦的扩展模块, 删除目录即卸载
+
 </details>
 
 ---
+
+
 
 ## 📸 界面预览
 
@@ -205,7 +211,46 @@
 
 ### 📸 [查看更多界面截图 »](./screenshots/README.md)
 
+---
+
 </div>
+
+## 🤖 AI 对话助手
+
+不想挨个页面点着找数据?**把问题直接问出来** —— 助手在本地真实数据上调用工具取数, 逐字流式作答, 每次取数都可展开核对。
+
+![AI 对话助手 — 市场总览问答](./screenshots/AI对话助手.png)
+
+| 打开方式 | 说明 |
+| :--- | :--- |
+| **悬浮球** | 可拖动, 位置记忆; 生成中带状态指示点 |
+| **AI 徽标旁入口** | 侧栏顶部模型徽标右侧, 一键展开 |
+| **⌘K / Ctrl+K** | 全局快捷键随时呼出, Esc 关闭 |
+
+**能问什么** — 18 个只读工具覆盖全站页面能力:
+
+| 类别 | 覆盖能力 |
+| :--- | :--- |
+| **个股** | 实时行情快照(支持批量) · 日线区间 · 关键价位分析 · 财务五表(指标/利润/资负/现金流/股本) |
+| **大盘** | 看板总览(涨跌家数·成交额·涨停连板·情绪雷达) · 指数行情 · 市场环境(regime) · 异动监控 |
+| **板块** | 概念/行业板块盘中轮动、切换事件与资金排名 |
+| **我的数据** | 自选列表(含备注与实时涨跌) · 持仓提醒 · 信号库 |
+| **策略与因子** | 策略目录 · 执行选股策略取标的 · 因子目录 · 因子全市场排名 · 策略回测 |
+
+**交互设计**
+
+- **逐字流式输出** — 文本按 token 逐步渲染, 长回答不再"整段蹦出"
+- **工具足迹卡** — 每次调用的工具名、参数、耗时、结果摘要均可展开核对; 取数可核对是设计铁律
+- **非模态面板** — 从页面右缘滑入, 默认 720px, 左缘拖拽调宽(宽度记忆), 边看行情边问
+- **会话历史** — 本地保存, 支持多会话切换与删除, 刷新不丢
+- **固定合规提示** — 每条回答完成后附风险提示与数据口径提示
+
+**完全解耦的扩展模块**
+
+助手是项目扩展系统的参考实现, **零核心文件修改**: 后端 `app/custom/assistant/`(启动时自动发现并注册独立路由)与前端 `src/custom/assistant/`(构建时自动挂载到插槽)各自独立, **删除目录即整体卸载**。未配置 AI Key 或使用不支持工具调用的供应商(如 Codex CLI)时 fail-closed, 直接提示前往设置页。
+
+> ⚠️ 助手是数据分析工具, 不提供买卖指令; 涉及交易决策的问题会转换为客观的技术/财务状态、关键价位、风险因素与条件情景。
+
 
 ---
 
@@ -252,7 +297,7 @@ flowchart TB
 
     subgraph EXT["二次开发与扩展 · 贯穿各层的插槽"]
         direction LR
-        X1["自定义策略"] ~~~ X2["自定义信号"] ~~~ X3["扩展分析页面"] ~~~ X4["AI 接口"]
+        X1["自定义策略"] ~~~ X2["自定义信号"] ~~~ X3["扩展分析页面"] ~~~ X4["AI 接口"] ~~~ X5["AI 对话助手"]
     end
 
     DATA --- ROUTE
@@ -281,7 +326,7 @@ flowchart TB
     class D1,D2,D3,D4 data
     class D5 pluginSlot
     class R route
-    class X1,X2,X3,X4 ext
+    class X1,X2,X3,X4,X5 ext
 
     style FE fill:#f5f3ff,stroke:#c7d2fe,color:#3730a3
     style SVC fill:#ecfeff,stroke:#a5f3fc,color:#155e75
@@ -303,6 +348,7 @@ flowchart TB
 | **非路由数据集直连** | 龙虎榜/盘前风向标/交易日历等 fuyao 专有能力不进路由矩阵,由独立服务直连消费——按日 JSON 缓存(历史不可变)、交易日回退、四态降级 |
 | **回测执行隔离** | 回测在 spawn worker 子进程运行,持久 run ID,刷新/切页重连不丢任务;子进程结果消息经锁保护回传 |
 | **分层缓存** | enriched 读取时现算指标(存储仅 15 列基础数据,现算 68 列指标与信号)+ 进程内快照缓存;扩展字段按日分区快照,页面即配即用 |
+| **完全解耦扩展** | 后端 `app/custom/<包>/` 启动时自动发现、注册独立路由(版本不符或 setup 失败即隔离跳过), 前端 `src/custom/*/extension.tsx` 构建时自动挂载到插槽; 删除目录即整体卸载, 零核心文件修改 —— **AI 对话助手**即该机制的参考实现 |
 
 ### 技术栈
 
@@ -312,7 +358,7 @@ flowchart TB
 | **数据** | ![Polars](https://img.shields.io/badge/Polars-CD882D?logo=polars&logoColor=white)（计算）· ![DuckDB](https://img.shields.io/badge/DuckDB-FFF100?logo=duckdb&logoColor=black)（查询）· Parquet（存储） |
 | **回测** | 自研仓位模拟引擎(T+1/费用/滑点/分钟回放)· vectorbt(部分路径) |
 | **数据源** | [TickFlow](https://tickflow.org/auth/register?ref=V3KDKGXPEA) 官方 SDK · fuyao(同花顺 REST) · 插件化扩展(stock-sdk 示例插件 · YAML 自定义源) |
-| **AI**(可选) | ![OpenAI兼容](https://img.shields.io/badge/OpenAI兼容-412991?logo=openai&logoColor=white) DeepSeek / 通义 / Ollama 等 |
+| **AI**(可选) | ![OpenAI兼容](https://img.shields.io/badge/OpenAI兼容-412991?logo=openai&logoColor=white) DeepSeek / 通义 / Ollama 等 · 策略生成 / 报告 / **对话助手**(助手依赖工具调用能力, 需 OpenAI 兼容接口) |
 | **前端** | ![React 18](https://img.shields.io/badge/React_18-61DAFB?logo=react&logoColor=black) ![Vite](https://img.shields.io/badge/Vite-646CFF?logo=vite&logoColor=white) ![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&logoColor=white) ![Tailwind](https://img.shields.io/badge/Tailwind-06B6D4?logo=tailwindcss&logoColor=white) Tanstack Query · [Lightweight Charts](https://www.tradingview.com/lightweight-charts/)(TradingView 开源) · ![ECharts](https://img.shields.io/badge/ECharts-AA344D?logo=apacheecharts&logoColor=white) · dnd-kit |
 | **部署** | ![Docker](https://img.shields.io/badge/Docker_单容器-2496ED?logo=docker&logoColor=white) 两阶段构建,前端 dist 拷进后端镜像 |
 
@@ -410,6 +456,7 @@ cp .env.example .env       # 按需填 TICKFLOW_API_KEY(留空 = None 模式)
 3. **自选**页加标的 → **选股**页点策略卡片扫描 / 配自定义信号
 4. **回测**页选策略 + 区间 → 看净值 / 夏普 / 交易明细(SSE 实时进度),结果可导出 CSV、存候选一键复测
 5. **监控中心**配规则,盘中实时弹窗 + 持久化记录;**异动监控**覆盖竞价/盘中/偏移全时段
+6. 配好 AI Key 后,**悬浮球 / ⌘K** 呼出 **AI 对话助手**,直接问「今天市场怎么样」「我的自选表现如何」
 
 ---
 
@@ -419,7 +466,7 @@ cp .env.example .env       # 按需填 TICKFLOW_API_KEY(留空 = None 模式)
 
 ```ini
 TICKFLOW_API_KEY=              # 留空 = None 模式(历史日K免费);填 Key 解锁更多
-AI_API_KEY=                    # 留空 = 关闭 AI;填 Key 启用策略生成
+AI_API_KEY=                    # 留空 = 关闭 AI;填 Key 启用策略生成与 AI 对话助手
 PORT=3018                      # 服务端口
 ```
 
@@ -437,6 +484,7 @@ PORT=3018                      # 服务端口
 | 6      | 个股分析(专用日 K + 9 类关键价位 + AI 四维分析)                    | ✅    |
 | **v0.2** | 因子挖掘全链路 · 市场阶段与主线识别 · 异动监控 · 数据源插件化     | ✅    |
 | **v0.3** | 能力路由矩阵 · fuyao 数据源(财务/龙虎榜/风向标) · 分钟策略与回测 · 交易日探针 · 全时段异动中心 · 回测导出与候选复测 | ✅ |
+| **AI 助手** | 对话式数据问答: 18 个只读工具覆盖全站页面 · 逐字流式 + 工具足迹卡 · 完全解耦扩展模块(本分支开发中) | 🚧 |
 | **v2** | Webhook 推送· 板块异动 · 早晚报 · 全市场竞价采集 · 更多扩展        | 🚧    |
 
 ---

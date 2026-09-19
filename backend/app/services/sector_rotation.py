@@ -33,6 +33,7 @@ from typing import Any
 
 import polars as pl
 
+from app.market_time import trading_minutes_elapsed_from_dt
 from app.services.ext_data import ExtConfigStore
 from app.services.rps_rotation import _load_concept_map_df
 
@@ -474,11 +475,12 @@ def _compute(repo, data_dir: Path, kind: str, flow_field: str | None, top: int, 
     per_bucket.sort(key=lambda item: item["bucket"])
     market_map = {row["_bucket"]: row["_mpct"] for row in market.iter_rows(named=True)}
 
-    # 对照窗口: 距当前桶约 _RANK_WINDOW_MIN 分钟的最近历史桶
+    # 对照窗口: 距当前桶约 _RANK_WINDOW_MIN 个交易分钟的最近历史桶 (午休不计,
+    # 与活跃度窗口按桶数回看同口径; 按墙钟算时 13:00~13:59 会拿 11:30 桶作「1 小时前」)
     def _reference_index(index: int) -> int | None:
-        current = per_bucket[index]["bucket"]
+        current = trading_minutes_elapsed_from_dt(per_bucket[index]["bucket"])
         for back in range(index - 1, -1, -1):
-            delta_min = (current - per_bucket[back]["bucket"]).total_seconds() / 60.0
+            delta_min = current - trading_minutes_elapsed_from_dt(per_bucket[back]["bucket"])
             if delta_min >= _RANK_WINDOW_MIN:
                 return back
         return 0 if index > 0 else None  # 不足一小时: 与最早桶比; 首桶无对照

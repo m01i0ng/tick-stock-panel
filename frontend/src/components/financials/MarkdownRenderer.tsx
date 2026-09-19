@@ -13,30 +13,69 @@ import { Fragment, type ReactNode } from 'react'
  * - 引用 >
  * - 分隔线 --- / ***
  * - 段落
+ * - 涨跌语义 token: 带符号百分比(+2.35% / -1.20%)按 A 股口径红涨绿跌着色;
+ *   「涨停/跌停」徽章化, 「上涨/下跌/高开/低开/走强/走弱」方向词着色,
+ *   金额数字等宽(对齐 format.priceColorClass 与设计语言"数字等宽")
  *
  * 不追求完整 GFM,只覆盖 AI 报告会产出的结构。
  */
 
-// ===== 行内格式:加粗 / 行内代码 / 星号评级 =====
+// ===== 行内格式:加粗 / 行内代码 / 涨跌语义 token =====
 
 function renderInline(text: string, keyBase: string): ReactNode[] {
   const nodes: ReactNode[] = []
-  // 正则:匹配 **加粗** 或 `代码` 或 ★ 评级
-  const re = /(\*\*([^*]+)\*\*)|(`([^`]+)`)/g
+  // 涨跌语义 token: 带符号百分比/涨跌停词/方向词/金额数字。词表有意收窄 —
+  // 只染有明确方向或语义的片段, 避免整段文字变成圣诞树; 无符号百分比
+  // (换手率等)数值本身无方向, 不着色。语义色对齐 A 股口径(红涨绿跌)。
+  const re = /(\*\*([^*]+)\*\*)|(`([^`]+)`)|([+-]\d+(?:\.\d+)?%)|(涨停|跌停)|(上涨|下跌|高开|低开|走强|走弱)|(\d[\d,]*(?:\.\d+)?)(?=[元亿万])/g
   let last = 0
   let m: RegExpExecArray | null
   let i = 0
   while ((m = re.exec(text)) !== null) {
     if (m.index > last) nodes.push(<Fragment key={`${keyBase}-t-${i}`}>{text.slice(last, m.index)}</Fragment>)
     if (m[1]) {
-      // 加粗
-      nodes.push(<strong key={`${keyBase}-b-${i}`} className="font-semibold text-foreground">{m[2]}</strong>)
+      // 加粗; 内容递归渲染, 让 **+2.35%** 这类嵌套 token 也拿到语义色
+      nodes.push(
+        <strong key={`${keyBase}-b-${i}`} className="font-semibold text-foreground">
+          {renderInline(m[2], `${keyBase}-b-${i}`)}
+        </strong>,
+      )
     } else if (m[3]) {
       // 行内代码
       nodes.push(
         <code key={`${keyBase}-c-${i}`} className="px-1 py-0.5 rounded bg-elevated text-[0.85em] font-mono text-accent">
           {m[4]}
         </code>,
+      )
+    } else if (m[5] !== undefined) {
+      // 带符号涨跌幅: 红涨绿跌 + 中等字重
+      nodes.push(
+        <span key={`${keyBase}-p-${i}`} className={`font-medium ${m[5].startsWith('+') ? 'text-bull' : 'text-bear'}`}>
+          {m[5]}
+        </span>,
+      )
+    } else if (m[6]) {
+      // 涨跌停: 徽章式底色, 对齐信号标签样式
+      const up = m[6] === '涨停'
+      nodes.push(
+        <span key={`${keyBase}-l-${i}`} className={`rounded px-1 font-medium ${up ? 'bg-bull/10 text-bull' : 'bg-bear/10 text-bear'}`}>
+          {m[6]}
+        </span>,
+      )
+    } else if (m[7]) {
+      // 方向词: 仅着色不加底色
+      const up = m[7] === '上涨' || m[7] === '高开' || m[7] === '走强'
+      nodes.push(
+        <span key={`${keyBase}-d-${i}`} className={up ? 'text-bull' : 'text-bear'}>
+          {m[7]}
+        </span>,
+      )
+    } else {
+      // 金额数字: 等宽(设计语言: 数字等宽); 单位留在 span 外
+      nodes.push(
+        <span key={`${keyBase}-n-${i}`} className="font-mono">
+          {m[8]}
+        </span>,
       )
     }
     last = m.index + m[0].length

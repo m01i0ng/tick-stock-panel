@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import * as echarts from 'echarts'
 import type { ECharts, EChartsOption } from 'echarts'
 import type { MinuteKlineRow, PriceLimitInfo } from '@/lib/api'
-import { computeIntradayAverage, formatMinuteTime, FULL_DAY_TIMES } from '@/lib/intraday-chart'
+import { computeIntradayAverage, formatMinuteTime, FULL_DAY_TIMES, summarizeMinutes, type DailySummary } from '@/lib/intraday-chart'
 import { useChartTheme, type ChartTheme } from '@/lib/theme'
 
 type YMode = 'adaptive' | 'limit'
@@ -21,6 +21,7 @@ interface Props {
   height?: number
   prevClose?: number
   date?: string
+  dailySummary?: DailySummary
   priceLimit?: PriceLimitInfo
   onPriceHover?: (price: number | null) => void
   onPriceDoubleClick?: (price: number, currentPrice: number) => void
@@ -402,6 +403,7 @@ export function EChartsIntraday({
   height = 320,
   prevClose,
   date,
+  dailySummary,
   priceLimit,
   onPriceHover,
   onPriceDoubleClick,
@@ -426,10 +428,11 @@ export function EChartsIntraday({
   // 全日索引 → 数据数组索引 的映射 (ref 避免重建 chart)
   const fullDayToDataIdx = useRef<Map<number, number>>(new Map())
 
-  const [infoIdx, setInfoIdx] = useState(data.length - 1)
+  const [infoIdx, setInfoIdx] = useState(-1)
   const [yMode, setYMode] = useState<YMode>('adaptive')
   const ct = useChartTheme()
   const avgPrices = useMemo(() => computeIntradayAverage(data), [data])
+  const summary = useMemo(() => summarizeMinutes(data), [data])
 
   // 分时线颜色：基于最新价 vs 昨收
   const lastClose = data.length > 0 ? data[data.length - 1].close : null
@@ -439,8 +442,8 @@ export function EChartsIntraday({
   const areaFill = lineIsFlat ? 'rgba(180,180,190,0.40)' : lineIsUp ? 'rgba(199,64,64,0.40)' : 'rgba(34,197,94,0.40)'
 
   useEffect(() => {
-    setInfoIdx(data.length - 1)
-  }, [data.length])
+    setInfoIdx(-1)
+  }, [date])
 
   useEffect(() => {
     const el = containerRef.current
@@ -470,6 +473,7 @@ export function EChartsIntraday({
         const axesInfo = event.axesInfo
         if (!axesInfo) return
         for (const info of Object.values(axesInfo)) {
+          if ((info as any)?.axisDim !== 'x') continue
           const val = (info as any)?.value
           if (val == null) continue
           const fullDayIdx = typeof val === 'number' ? val : -1
@@ -479,6 +483,8 @@ export function EChartsIntraday({
             const d = dataRef.current
             if (dataIdx >= 0 && dataIdx < d.length) {
               onPriceHoverRef.current?.(d[dataIdx].close)
+            } else {
+              onPriceHoverRef.current?.(null)
             }
             return
           }
@@ -486,6 +492,7 @@ export function EChartsIntraday({
       })
 
       chart.on('globalout', () => {
+        setInfoIdx(-1)
         onPriceHoverRef.current?.(null)
       })
 
@@ -518,6 +525,7 @@ export function EChartsIntraday({
 
       chart.setOption(buildOption(data, prevClose, avgPrices, lineColor, areaFill, yMode, ct, priceLimit, showLimitLines, showAvgLine, priceLines), true)
     } else {
+      fullDayToDataIdx.current = new Map()
       chart.clear()
     }
   }, [data, prevClose, height, lineColor, areaFill, yMode, ct, priceLimit, showLimitLines, showAvgLine, priceLines])
@@ -538,8 +546,11 @@ export function EChartsIntraday({
     }
   }, [])
 
-  const d = infoIdx >= 0 && infoIdx < data.length ? data[infoIdx] : null
-  const avg = d != null ? avgPrices[infoIdx] : null
+  const hovered = infoIdx >= 0 && infoIdx < data.length ? data[infoIdx] : null
+  const d = hovered ?? summary
+  const daily = dailySummary?.date === date ? dailySummary : undefined
+  const ohlc = hovered ?? daily ?? summary
+  const avg = d != null ? avgPrices[hovered ? infoIdx : data.length - 1] : null
   const chg = d && prevClose != null ? d.close - prevClose : null
   const isUp = chg != null ? chg > 0 : true
   const isFlat = chg != null ? chg === 0 : false
@@ -575,24 +586,25 @@ export function EChartsIntraday({
       </div>}
       <div style={{ backgroundColor: ct.infoBarBg }}>
         {/* 第一行: 日期 + OHLC */}
-        <div className="flex items-center gap-x-2 px-2 font-mono text-[11px] select-none flex-wrap" style={{ height: 20 }}>
+        <div className="flex items-center gap-x-2 px-2 font-mono text-[11px] select-none flex-wrap" style={{ minHeight: 20 }}>
           {!d && <span className="text-muted">—</span>}
-          {d && (
+          {ohlc && (
             <>
               {date && <span className="text-muted">{date}</span>}
+              <span className="text-muted">{hovered ? `${formatMinuteTime(hovered.datetime)} 分钟` : daily ? '日K（前复权）' : '分时汇总'}</span>
               <span className="text-muted">开</span>
-              <span style={{ color: priceClr }}>{d.open != null ? d.open.toFixed(2) : '—'}</span>
+              <span style={{ color: priceClr }}>{ohlc.open != null ? ohlc.open.toFixed(2) : '—'}</span>
               <span className="text-muted">高</span>
-              <span style={{ color: priceClr }}>{d.high.toFixed(2)}</span>
+              <span style={{ color: priceClr }}>{ohlc.high.toFixed(2)}</span>
               <span className="text-muted">低</span>
-              <span style={{ color: priceClr }}>{d.low.toFixed(2)}</span>
+              <span style={{ color: priceClr }}>{ohlc.low.toFixed(2)}</span>
               <span className="text-muted">收</span>
-              <span style={{ color: priceClr }} className="font-semibold">{d.close.toFixed(2)}</span>
+              <span style={{ color: priceClr }} className="font-semibold">{ohlc.close.toFixed(2)}</span>
             </>
           )}
         </div>
         {/* 第二行: 价格+均价+量+额 */}
-        <div className="flex items-center gap-x-4 px-2 font-mono text-[11px] select-none" style={{ height: 20 }}>
+        <div className="flex flex-wrap items-center gap-x-2 px-2 font-mono text-[11px] select-none" style={{ minHeight: 20 }}>
           {d && (
             <>
               <span className="flex items-center gap-x-1">
@@ -603,9 +615,9 @@ export function EChartsIntraday({
                 <span style={{ display: 'inline-block', width: 14, height: 2, background: THEME.avgLine }} />
                 <span style={{ color: THEME.avgLine }}>{avg != null ? avg.toFixed(2) : '—'}</span>
               </span>}
-              <span className="text-muted">量</span>
+              <span className="text-muted">{hovered ? '量' : '累计量'}</span>
               <span className="text-secondary">{d.volume.toFixed(0)}</span>
-              <span className="text-muted">额</span>
+              <span className="text-muted">{hovered ? '额' : '累计额'}</span>
               <span className="text-secondary">{fmtAmt(d.amount)}</span>
             </>
           )}
