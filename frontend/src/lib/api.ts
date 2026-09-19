@@ -2482,11 +2482,11 @@ export const api = {
     ),
   indexChan: (symbol: string, dateRange: { start: string; end: string }) =>
     request<IndexChanAnalysis>(
-      `/api/index/chan?symbol=${encodeURIComponent(symbol)}&start_date=${dateRange.start}&end_date=${dateRange.end}`,
+      `/api/custom/chan?symbol=${encodeURIComponent(symbol)}&start_date=${dateRange.start}&end_date=${dateRange.end}`,
     ),
   indexChanMinute: (symbol: string, days = 45) =>
     request<IndexChanAnalysis>(
-      `/api/index/chan/minute?symbol=${encodeURIComponent(symbol)}&days=${days}`,
+      `/api/custom/chan/minute?symbol=${encodeURIComponent(symbol)}&days=${days}`,
     ),
   indexMinute: (symbol: string, date?: string) =>
     request<{

@@ -6,10 +6,12 @@ from types import SimpleNamespace
 
 import polars as pl
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 
-from app.api.indices import get_index_chan, get_index_chan_minute
-from app.services import chan_analysis
+from app.custom.chan import analysis as chan_analysis
+from app.custom.chan.routes import get_index_chan, get_index_chan_minute
+from app.extensions.loader import configure_backend_extensions
 
 
 def _sample(rows: int = 1200) -> pl.DataFrame:
@@ -126,3 +128,19 @@ def test_index_chan_minute_uses_nearest_divisible_level(monkeypatch):
     ]
     assert result["levels"][-1]["bars"][-2]["date"].endswith("11:30")
     assert result["levels"][-1]["bars"][-1]["date"].endswith("15:00")
+
+
+def test_extension_registers_routes_via_loader() -> None:
+    """chan 扩展经 custom 加载器自动注册到 /api/custom/chan, 空数据 fail-soft。"""
+    app = FastAPI()
+    registry, errors = configure_backend_extensions(app)
+    assert "indices.chan" in registry.extension_ids()
+    assert errors == ()
+
+    app.state.repo = SimpleNamespace(get_index_daily=lambda symbol, start, end: pl.DataFrame())
+    client = TestClient(app)
+    resp = client.get("/api/custom/chan", params={
+        "symbol": "000001.SH", "start_date": "2026-01-01", "end_date": "2026-01-02",
+    })
+    assert resp.status_code == 200
+    assert resp.json()["levels"] == []
