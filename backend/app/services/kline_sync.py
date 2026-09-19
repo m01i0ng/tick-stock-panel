@@ -1088,17 +1088,48 @@ def intraday_monitor_support(capset: CapabilitySet | None) -> dict[str, object]:
     }
 
 
-def _to_tickflow_symbol(val: str) -> str:
-    s = str(val).strip()
-    if not s or "." in s:
-        return s
-    if s.startswith(("6", "9")):
-        return f"{s}.SH"
-    elif s.startswith(("0", "2", "3")):
-        return f"{s}.SZ"
-    elif s.startswith(("8", "4")):
-        return f"{s}.BJ"
-    return f"{s}.SZ"
+def _resolve_monitor_symbols(symbols: list[str]) -> tuple[list[str], dict[str, str]]:
+    """分时监控的裸符号按 instruments 维表补全后缀 (与日K同步 #302 同口径)。
+
+    返回 (去重后的完整符号请求列表, {完整符号: 调用方原始写法}。
+    首位数字猜后缀对歧义代码会静默拉错标的 (裸 000001 猜成 000001.SZ),
+    因此维表无唯一匹配的裸符号显式跳过并告警, 不发请求。
+    """
+    uniq = list(dict.fromkeys(str(s).strip() for s in symbols if str(s).strip()))
+    if not any("." not in s for s in uniq):
+        return uniq, {}
+
+    from app.config import settings
+    index = _instruments_symbol_index(settings.data_dir)
+    out: list[str] = []
+    restore: dict[str, str] = {}
+    for s in uniq:
+        if "." in s:
+            out.append(s)
+            continue
+        matches = (index or {}).get(s, [])
+        if len(matches) == 1:
+            out.append(matches[0])
+            restore[matches[0]] = s
+        else:
+            logger.warning(
+                "分时监控: 裸符号 %s 在维表中无唯一匹配, 已跳过 "
+                "(先同步标的维表, 或改用带后缀符号如 600000.SH)", s)
+    return out, restore
+
+
+def _restore_symbol_form(df: pl.DataFrame, restore: dict[str, str]) -> pl.DataFrame:
+    """把分钟结果的完整符号还原为调用方原始写法; 未映射符号原样保留。
+
+    分时信号 evaluator 按监控规则里的原始字符串过滤 symbol 列,
+    裸符号补全拉取后必须还原, 否则 evaluate 的 is_in 过滤一行都命中不了。
+    """
+    if df.is_empty() or not restore:
+        return df
+    return df.with_columns(
+        pl.col("symbol").cast(pl.Utf8).replace_strict(
+            restore, default=pl.col("symbol"), return_dtype=pl.Utf8)
+    )
 
 
 def fetch_intraday_monitor_batch(
@@ -1114,42 +1145,36 @@ def fetch_intraday_monitor_batch(
     now = now or cn_now()
     start_time = now.replace(hour=9, minute=25, second=0, microsecond=0)
     source = support["source"]
+    tf_symbols, restore = _resolve_monitor_symbols(symbols)
+    if not tf_symbols:
+        return pl.DataFrame()
     if source in {"custom_minute", "minute_batch"}:
         limits = capset.limits(Cap.KLINE_MINUTE_BATCH) if capset and capset.has(Cap.KLINE_MINUTE_BATCH) else None
-        tf_symbols = [_to_tickflow_symbol(s) for s in symbols]
         raw_df = sync_minute_batch(
             tf_symbols, start_time=start_time, end_time=now,
             batch_size=limits.batch if limits else None,
             rpm=limits.rpm if limits else None,
         )
-        return raw_df.with_columns(pl.col("symbol").str.replace(r"\.[A-Za-z]+$", "")) if not raw_df.is_empty() else raw_df
+        return _restore_symbol_form(raw_df, restore)
 
     tf = get_client()
     frames: list[pl.DataFrame] = []
-    want_bare = any("." not in str(s) for s in symbols)
     try:
         if source == "intraday_batch":
             limits = capset.limits(Cap.INTRADAY_BATCH) if capset else None
-            tf_symbols = [_to_tickflow_symbol(s) for s in symbols]
             raw = tf.klines.intraday_batch(
                 tf_symbols, count=300, as_dataframe=False, show_progress=False,
                 batch_size=limits.batch if limits and limits.batch else 100,
             )
-            df = _normalize_minute(_compact_klines_to_df(raw))
-            if not df.is_empty() and want_bare:
-                df = df.with_columns(pl.col("symbol").str.replace(r"\.[A-Za-z]+$", ""))
+            df = _restore_symbol_form(_normalize_minute(_compact_klines_to_df(raw)), restore)
         elif source == "intraday_single":
-            tf_sym = _to_tickflow_symbol(symbols[0])
-            raw = tf.klines.intraday(tf_sym, count=300, as_dataframe=False)
-            df = _normalize_minute(_compact_klines_to_df(raw, default_symbol=symbols[0]))
-            if not df.is_empty() and want_bare:
-                df = df.with_columns(pl.col("symbol").str.replace(r"\.[A-Za-z]+$", ""))
+            raw = tf.klines.intraday(tf_symbols[0], count=300, as_dataframe=False)
+            df = _restore_symbol_form(
+                _normalize_minute(_compact_klines_to_df(raw, default_symbol=tf_symbols[0])), restore)
         elif source == "minute_single":
-            tf_sym = _to_tickflow_symbol(symbols[0])
-            raw = tf.klines.get(tf_sym, period="1m", count=300, as_dataframe=False)
-            df = _normalize_minute(_compact_klines_to_df(raw, default_symbol=symbols[0]))
-            if not df.is_empty() and want_bare:
-                df = df.with_columns(pl.col("symbol").str.replace(r"\.[A-Za-z]+$", ""))
+            raw = tf.klines.get(tf_symbols[0], period="1m", count=300, as_dataframe=False)
+            df = _restore_symbol_form(
+                _normalize_minute(_compact_klines_to_df(raw, default_symbol=tf_symbols[0])), restore)
         else:
             df = pl.DataFrame()
         if not df.is_empty():

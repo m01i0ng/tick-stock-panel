@@ -190,3 +190,68 @@ def test_intraday_batch_provider_is_normalized_without_network(monkeypatch):
     )
     assert result.columns == ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
     assert result["symbol"].to_list() == ["600000.SH"]
+
+
+def _tickflow_minute_client(monkeypatch, requested: list[str]):
+    """intraday_batch 假客户端: 断言收到的完整符号并按 key 返回一根分钟线。"""
+    monkeypatch.setattr("app.services.preferences.get_minute_data_provider", lambda: "tickflow")
+
+    class FakeKlines:
+        def intraday_batch(self, symbols, count, as_dataframe, show_progress, batch_size):
+            assert symbols == requested
+            ts = int(datetime(2026, 7, 17, 9, 30, tzinfo=CN_TZ).timestamp() * 1000)
+            return {
+                sym: {
+                    "timestamp": [ts],
+                    "open": [10.0], "high": [10.1], "low": [9.9], "close": [10.0],
+                    "volume": [1.0], "amount": [1000.0],
+                }
+                for sym in symbols
+            }
+
+    class FakeClient:
+        klines = FakeKlines()
+
+    monkeypatch.setattr("app.services.kline_sync.get_client", lambda: FakeClient())
+    return CapabilitySet({Cap.INTRADAY_BATCH: CapabilityLimits(batch=20, rpm=30)})
+
+
+def test_monitor_bare_symbol_resolved_via_instruments_and_restored(monkeypatch):
+    """裸符号经维表唯一匹配补全后缀拉取, 结果还原为调用方原始裸写法。"""
+    monkeypatch.setattr(
+        "app.services.kline_sync._instruments_symbol_index",
+        lambda data_dir: {"600000": ["600000.SH"]},
+    )
+    capset = _tickflow_minute_client(monkeypatch, requested=["600000.SH"])
+    result = fetch_intraday_monitor_batch(
+        ["600000"], capset, now=datetime(2026, 7, 17, 10, 0, tzinfo=CN_TZ),
+    )
+    assert result["symbol"].to_list() == ["600000"]
+
+
+def test_monitor_ambiguous_bare_symbol_skipped_fail_loud(monkeypatch, caplog):
+    """维表歧义 (000001 同码沪深两市) 的裸符号跳过不发请求, 不再首位猜后缀拉错标的。"""
+    monkeypatch.setattr(
+        "app.services.kline_sync._instruments_symbol_index",
+        lambda data_dir: {"000001": ["000001.SH", "000001.SZ"]},
+    )
+    capset = _tickflow_minute_client(monkeypatch, requested=[])  # 不应发生网络请求
+    with caplog.at_level("WARNING"):
+        result = fetch_intraday_monitor_batch(
+            ["000001"], capset, now=datetime(2026, 7, 17, 10, 0, tzinfo=CN_TZ),
+        )
+    assert result.is_empty()
+    assert any("000001" in rec.message for rec in caplog.records)
+
+
+def test_monitor_mixed_bare_and_suffixed_symbols_restored_exactly(monkeypatch):
+    """混合输入: 裸符号还原裸写法, 带后缀符号原样保留 (evaluator 按原始字符串过滤)。"""
+    monkeypatch.setattr(
+        "app.services.kline_sync._instruments_symbol_index",
+        lambda data_dir: {"600000": ["600000.SH"]},
+    )
+    capset = _tickflow_minute_client(monkeypatch, requested=["600000.SH", "510300.SH"])
+    result = fetch_intraday_monitor_batch(
+        ["600000", "510300.SH"], capset, now=datetime(2026, 7, 17, 10, 0, tzinfo=CN_TZ),
+    )
+    assert set(result["symbol"].to_list()) == {"600000", "510300.SH"}
