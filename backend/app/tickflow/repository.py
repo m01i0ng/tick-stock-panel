@@ -35,6 +35,7 @@ from app.enriched_generation import (
 from app.market_time import cn_today
 from app.parquet import scan_enriched_parquet
 from app.polars_guard import guarded_collect
+from app.services.minute_adjust import apply_minute_adjustment, minute_basis_is_raw
 
 logger = logging.getLogger(__name__)
 
@@ -1278,6 +1279,20 @@ class KlineRepository:
             df = cache.clear() if df.is_empty() else df.select(existing)
         return df.sort(["symbol", "date"])
 
+    def get_enriched_history_span(self) -> tuple[date, date] | None:
+        """内存 enriched 历史缓存的可用日期区间 (含端点); 不可用/预热中返回 None。
+
+        纯读 O(1), 不触发刷新: 调用方 (随行情 tick 反复调用的自选 enriched 端点) 需要
+        区分「预热中」与「日期超窗」, 而 get_enriched_range 对两者都返回 None。
+        """
+        cache = self._enriched_history_cache
+        start = self._enriched_history_start
+        if cache is None or cache.is_empty() or start is None:
+            return None
+        # 历史缓存与最新日缓存同批写入/清空, end 通常即 _enriched_cache_date;
+        # 仅当首次刷新在写 latest 之前中断时缺失, 回退取日期列最大值
+        return start, self._enriched_cache_date or cache["date"].max()
+
     def get_live_agg(self) -> pl.DataFrame:
         """返回盘中实时指标预计算聚合表。如无缓存则懒加载。
 
@@ -1594,6 +1609,20 @@ class KlineRepository:
         """按资产类型选择分钟K parquet glob。ETF 分钟数据独立存储于 kline_etf_minute。"""
         return self._etf_minute_glob if asset_type == "etf" else self._minute_glob
 
+    def _maybe_adjust_minute(self, df: pl.DataFrame, asset_type: str) -> pl.DataFrame:
+        """原始基准标记开启时应用读取时复权投影 (services/minute_adjust 三层架构)。
+
+        标记未开启 (存量未迁移) 原样返回, 行为与旧版逐字节一致; 投影异常也按原样
+        返回 (fail-open, 与日K缺因子语义一致), 不让复权层破坏数据可用性。
+        """
+        if df.is_empty() or not minute_basis_is_raw(self.store.data_dir):
+            return df
+        try:
+            return apply_minute_adjustment(df, self.store.data_dir, asset_type)
+        except Exception as e:
+            logger.warning("分钟复权投影失败, 按原始数据返回: %s", e)
+            return df
+
     def get_minute(
         self,
         symbol: str,
@@ -1602,12 +1631,13 @@ class KlineRepository:
     ) -> pl.DataFrame:
         """分钟K查询 — Polars scan_parquet + predicate pushdown。"""
         try:
-            return guarded_collect(
+            df = guarded_collect(
                 pl.scan_parquet(self._minute_glob_for(asset_type)).filter(
                     (pl.col("symbol") == symbol)
                     & (pl.col("datetime").dt.date() == trade_date)
                 ).sort("datetime")
             )
+            return self._maybe_adjust_minute(df, asset_type)
         except Exception as e:  # noqa: BLE001
             logger.warning("分钟K查询失败: %s", e)
             return pl.DataFrame()
@@ -1626,12 +1656,13 @@ class KlineRepository:
         if not symbols:
             return pl.DataFrame()
         try:
-            return guarded_collect(
+            df = guarded_collect(
                 pl.scan_parquet(self._minute_glob_for(asset_type)).filter(
                     pl.col("symbol").is_in(symbols)
                     & (pl.col("datetime").dt.date() == trade_date)
                 ).sort(["symbol", "datetime"])
             )
+            return self._maybe_adjust_minute(df, asset_type)
         except Exception as e:  # noqa: BLE001
             logger.warning("批量分钟K查询失败: %s", e)
             return pl.DataFrame()
@@ -1654,7 +1685,7 @@ class KlineRepository:
             lf = pl.scan_parquet(self._minute_glob_for(asset_type))
             available = set(lf.collect_schema().names())
             select_cols = [c for c in ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"] if c in available]
-            return guarded_collect(
+            df = guarded_collect(
                 lf.select(select_cols)
                 .filter(
                     pl.col("symbol").is_in(symbols)
@@ -1664,6 +1695,7 @@ class KlineRepository:
                 .sort(["symbol", "datetime"]),
                 streaming=True,
             )
+            return self._maybe_adjust_minute(df, asset_type)
         except Exception as e:  # noqa: BLE001
             logger.warning("分钟K范围查询失败: %s", e)
             return pl.DataFrame()
@@ -1699,12 +1731,13 @@ class KlineRepository:
             lf = pl.scan_parquet(parts)
             available = set(lf.collect_schema().names())
             select_cols = [c for c in ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"] if c in available]
-            return guarded_collect(
+            df = guarded_collect(
                 lf.select(select_cols)
                 .filter(pl.col("symbol").is_in(symbols))
                 .sort(["symbol", "datetime"]),
                 streaming=True,
             )
+            return self._maybe_adjust_minute(df, asset_type)
         except Exception as e:  # noqa: BLE001
             logger.warning("分钟K按日期查询失败: %s", e)
             return pl.DataFrame()

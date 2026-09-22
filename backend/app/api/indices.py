@@ -5,7 +5,7 @@ import logging
 import threading
 import time
 from datetime import date, datetime, timedelta
-from typing import Annotated
+from typing import Optional
 
 import polars as pl
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -42,18 +42,22 @@ def get_index_daily(
     request: Request,
     symbol: str = Query(..., description="指数代码, 如 000001.SH"),
     days: int = Query(120, ge=10, le=2000),
-    start_date: str | None = Query(None, description="起始日期 YYYY-MM-DD, 优先于 days"),
-    end_date: str | None = Query(None, description="截止日期 YYYY-MM-DD, 默认今天"),
+    start_date: Optional[str] = Query(None, description="起始日期 YYYY-MM-DD, 优先于 days"),
+    end_date: Optional[str] = Query(None, description="截止日期 YYYY-MM-DD, 默认今天"),
 ):
     """读取指数日 K。指数数据使用独立 kline_index_* parquet。"""
     repo = request.app.state.repo
-    end = date.fromisoformat(end_date) if end_date else date.today()
+    # 未传 end_date 时用北京今天。实时注入只在内存缓存命中时补当日 K,
+    # 缓存冷时 parquet 当日行能否进结果取决于这个窗口右端。
+    end = date.fromisoformat(end_date) if end_date else cn_today()
     start = date.fromisoformat(start_date) if start_date else end - timedelta(days=days)
     info = _index_info(repo, symbol)
 
     df = repo.get_index_daily(symbol, start, end)
     if not df.is_empty():
-        return {"symbol": symbol, "name": info.get("name"), "index_info": info, "rows": df.to_dicts(), "source": "index_enriched"}
+        from app.api.kline import _maybe_inject_live_candle
+        rows = _maybe_inject_live_candle(request, symbol, df.to_dicts(), "index")
+        return {"symbol": symbol, "name": info.get("name"), "index_info": info, "rows": rows, "source": "index_enriched"}
 
     capset = request.app.state.capabilities
     if not capset.has(Cap.KLINE_DAILY_BATCH):
@@ -61,7 +65,7 @@ def get_index_daily(
 
     try:
         raw = kline_sync.sync_daily_batch([symbol], count=days + 150)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"TickFlow fetch failed: {e}") from e
     if raw.is_empty():
         return {"symbol": symbol, "name": info.get("name"), "index_info": info, "rows": [], "source": "none"}
@@ -75,9 +79,7 @@ def get_index_daily(
 def get_index_minute(
     request: Request,
     symbol: str = Query(..., description="指数代码, 如 000001.SH"),
-    trade_date: Annotated[
-        date | None, Query(alias="date", description="交易日期, 休市时默认最近本地指数交易日")
-    ] = None,
+    trade_date: date | None = Query(None, alias="date", description="交易日期, 休市时默认最近本地指数交易日"),
 ):
     """实时读取指数分钟 K。不写入股票分钟 parquet。
 

@@ -20,7 +20,7 @@ import polars as pl
 from app.data_providers.base import AssetType
 from app.indicators.pipeline import filter_halt_days
 from app.market_time import CN_TZ, cn_now, cn_today
-from app.services import preferences
+from app.services import minute_adjust, preferences
 from app.tickflow.capabilities import Cap, CapabilitySet
 from app.tickflow.client import get_client
 from app.tickflow.rate_limits import chunked, resolve_limit, sleep_between_batches
@@ -931,10 +931,11 @@ def sync_minute_batch(
     count: int | None = None,
     batch_size: int | None = None,
     rpm: int | None = None,
-    on_chunk_done: Callable[[int, int, str], None] | None = None,
+    on_chunk_done: Callable[[int, int, str] | None] | None = None,
     segment_trading_days: int = 20,
     on_segment: Callable[[pl.DataFrame], None] | None = None,
     asset_type: AssetType = "stock",
+    raw_basis: bool = False,
 ) -> pl.DataFrame:
     """批量拉取多股分钟 K。
 
@@ -1015,12 +1016,12 @@ def sync_minute_batch(
                         start_time=_datetime_to_ms(cur_start),
                         end_time=_datetime_to_ms(cur_end),
                         count=10000,
-                        adjust="forward",
+                        adjust="none" if raw_basis else "forward",
                         as_dataframe=False, show_progress=False,
                     )
                 else:
                     raw = tf.klines.batch(chunk, period="1m", count=count or 1200,
-                                          adjust="forward",
+                                          adjust="none" if raw_basis else "forward",
                                           as_dataframe=False, show_progress=False)
             except Exception as e:  # noqa: BLE001
                 logger.warning("minute batch fetch failed for %d symbols: %s", len(chunk), e)
@@ -1439,15 +1440,48 @@ def fetch_minute_single(
     trade_date: date,
     asset_type: AssetType = "stock",
     *,
-    capset: CapabilitySet | None = None,
+    capset: CapabilitySet,
+    raw_basis: bool = False,
 ) -> pl.DataFrame:
-    """实时拉取单股单日分钟 K(不写入本地)。优先自定义分钟源, 回退 TickFlow。"""
+    """实时拉取单股单日分钟 K(不写入本地)。
+
+    优先使用当前自定义分钟源。仅当 TickFlow 原生单股分钟能力存在时才允许
+    回退 TickFlow; 自定义源增广只授予 batch 能力, 不会误放行该回退路径。
+    """
+    from datetime import datetime
     # 北京时间窗口必须带时区: naive datetime 会被 .timestamp() 按服务器本地时区解释,
     # UTC 容器上窗口整体偏移 8 小时, 分时补拉必然为空。
     start_time = datetime(trade_date.year, trade_date.month, trade_date.day, 9, 25, 0, tzinfo=CN_TZ)
     end_time = datetime(trade_date.year, trade_date.month, trade_date.day, 15, 5, 0, tzinfo=CN_TZ)
 
-    return fetch_minute_period(symbol, start_time, end_time, 1, asset_type, capset=capset)
+    # 自定义数据源分流: 与 sync_minute_batch 一致, 配了自定义分钟源时走 custom provider,
+    # 避免无 TickFlow Pro+ 权限的用户分时图首次打开(本地无数据)时补拉失败返回空。
+    df, fallback = _try_custom_minute(
+        [symbol], start_time=start_time, end_time=end_time,
+        asset_type=asset_type, freq="1m",
+    )
+    if not fallback:
+        # 见 sync_minute_batch 同分支注释: df 在此必非 None。
+        return df if df is not None else pl.DataFrame()
+
+    if not capset.has(Cap.KLINE_MINUTE_BY_SYMBOL):
+        return pl.DataFrame()
+
+    tf = get_client()
+    try:
+        raw = tf.klines.batch(
+            [symbol], period="1m",
+            start_time=_datetime_to_ms(start_time),
+            end_time=_datetime_to_ms(end_time),
+            count=10000,
+            adjust="none" if raw_basis else "forward",
+            as_dataframe=False, show_progress=False,
+        )
+    except Exception as e:
+        logger.warning("fetch_minute_single(%s, %s) failed: %s", symbol, trade_date, e)
+        return pl.DataFrame()
+
+    return _normalize_minute(_compact_klines_to_df(raw, default_symbol=symbol))
 
 
 def fetch_adj_factor_single(symbol: str) -> pl.DataFrame:
@@ -1591,8 +1625,10 @@ def sync_and_persist_minute(
     extend_backward: bool = False,
     force_full_days: bool = False,
 ) -> int:
-    """同步分钟 K 并存到 Parquet(前复权价格, SDK 端 adjust=qfq)。返回写入行数。
+    """同步分钟 K 并存到 Parquet。返回写入行数。
 
+    存储口径由基准标记决定 (services/minute_adjust): 存量未迁移 → SDK adjust=qfq
+    前复权 (旧行为); 已迁移 → adjust='none' 原始价落盘, 复权读取时投影。
     使用 start_time / end_time 区间拉取, 确保所有标的覆盖同一时间段。
     on_chunk_done(current, total) 每个 chunk 完成后回调。
     force_full_days=True 时强制回溯 days 自然日 (不增量补, 用于个股补齐历史)。
@@ -1676,6 +1712,7 @@ def sync_and_persist_minute(
         segment_trading_days=segment_days,
         on_segment=_persist,
         asset_type="stock",
+        raw_basis=minute_adjust.minute_basis_is_raw(repo.store.data_dir),
     )
 
     if written_box[0] == 0:
