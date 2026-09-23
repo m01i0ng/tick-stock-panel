@@ -14,6 +14,7 @@ from pathlib import Path
 import polars as pl
 
 from app.services.fs_utils import atomic_write_parquet
+from app.market_time import cn_today
 from app.tickflow.client import get_client
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,42 @@ def _fetch_instruments_via_provider() -> list[dict] | None:
     return rows
 
 
+def append_name_history(
+    data_dir: Path,
+    instruments: pl.DataFrame,
+    as_of: date,
+) -> int:
+    """把当日 (as_of, symbol, name) 追加到本地名称历史表。
+
+    数据源只提供当前名称, ST 摘帽/戴帽的涨跌停档位判定需要按日期回溯;
+    每次盘前同步追加一行, 数据随时间自愈。同日重复同步覆盖同键不产生
+    重复行。返回表中总行数。
+    """
+    if "symbol" not in instruments.columns or "name" not in instruments.columns:
+        return 0
+    fresh = (
+        instruments.select("symbol", "name")
+        .drop_nulls()
+        .with_columns(pl.lit(as_of).cast(pl.Date).alias("as_of"))
+        .select("as_of", "symbol", "name")
+    )
+    if fresh.is_empty():
+        return 0
+    path = data_dir / "instruments" / "name_history.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        old = pl.read_parquet(path).select("as_of", "symbol", "name")
+        merged = (
+            pl.concat([old, fresh])
+            .sort("as_of")
+            .unique(subset=["as_of", "symbol"], keep="last", maintain_order=True)
+        )
+    else:
+        merged = fresh
+    atomic_write_parquet(merged, path)
+    return merged.height
+
+
 def sync_instruments(data_dir: Path) -> int:
     """全量同步标的维表 → data/instruments/instruments.parquet。
 
@@ -88,18 +125,24 @@ def sync_instruments(data_dir: Path) -> int:
                 if items:
                     all_rows.extend(_flatten_instruments(items))
                     logger.info("instruments %s: %d stocks", ex, len(items))
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.warning("get_instruments(%s) failed: %s", ex, e)
 
     if not all_rows:
         return 0
 
     df = pl.DataFrame(all_rows)
-    df = df.with_columns(pl.lit(date.today()).alias("as_of"))
+    as_of = cn_today()
+    df = df.with_columns(pl.lit(as_of).alias("as_of"))
 
     out = data_dir / "instruments" / "instruments.parquet"
     out.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_parquet(df, out)
+    # 名称历史独立累积, 不随维表全量覆盖丢失
+    try:
+        append_name_history(data_dir, df, as_of)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("name_history append failed: %s", e)
 
     logger.info("instruments synced: %d rows → %s", df.height, out)
     return df.height

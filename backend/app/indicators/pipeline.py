@@ -730,6 +730,7 @@ def compute_limit_signals(
     instruments: pl.DataFrame,
     needed: set[str] | None = None,
     historical_shares: pl.DataFrame | None = None,
+    name_history: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     """计算涨跌停相关信号。
 
@@ -793,6 +794,11 @@ def compute_limit_signals(
         inst_subset = _attach_no_limit_window(inst_subset)
 
     df = df.join(inst_subset, on="symbol", how="left", suffix="_inst")
+    if need_price_limits and "name" in instruments.columns:
+        # ST 档位按行日期回溯名称历史, 无记录回退当前名
+        df = _apply_name_history_st(
+            df, name_history if name_history is not None else load_name_history(),
+        )
 
     if "turnover_rate" in want:
         df = apply_historical_float_shares(df, historical_shares, today=cn_today())
@@ -1929,6 +1935,73 @@ def _load_factors(factor_path: Path) -> pl.DataFrame:
         return pl.DataFrame()
 
 
+_name_history_cache: dict[str, tuple[float, pl.DataFrame]] = {}
+
+
+def load_name_history(data_dir: Path | str | None = None) -> pl.DataFrame:
+    """加载本地名称历史表 (as_of, symbol, name), 按 mtime 缓存。
+
+    数据源只提供当前名称; ST 摘帽/戴帽的涨跌停档位判定需要按日期回溯,
+    表由 instrument_sync 每日追加。缺文件/缺列时返回空表 (调用方回退当前名)。
+    """
+    path = Path(data_dir or settings.data_dir) / "instruments" / "name_history.parquet"
+    key = str(path)
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        _name_history_cache.pop(key, None)
+        return pl.DataFrame()
+    cached = _name_history_cache.get(key)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    try:
+        frame = pl.read_parquet(path)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("name_history 读取失败: %s", e)
+        return pl.DataFrame()
+    if not {"as_of", "symbol", "name"}.issubset(frame.columns):
+        frame = pl.DataFrame()
+    _name_history_cache[key] = (mtime, frame)
+    return frame
+
+
+def _apply_name_history_st(df: pl.DataFrame, name_history: pl.DataFrame | None) -> pl.DataFrame:
+    """用名称历史把常量 _is_st 覆盖为按行日期 asof 的档位判定。
+
+    无记录日期回退当前名称(冷启动兼容); 表为空时保持原样。
+    """
+    if name_history is None or name_history.is_empty():
+        return df
+    if "date" not in df.columns or "_is_st" not in df.columns:
+        return df
+    hist = (
+        name_history
+        .select(
+            pl.col("as_of").cast(pl.Date, strict=False).alias("_nh_date"),
+            "symbol",
+            pl.col("name").alias("_nh_name"),
+        )
+        .drop_nulls()
+        .unique(subset=["symbol", "_nh_date"], keep="last")
+        .sort("_nh_date")
+    )
+    if hist.is_empty():
+        return df
+    return (
+        df
+        .sort("date")
+        .join_asof(hist, left_on="date", right_on="_nh_date", by="symbol", strategy="backward")
+        .with_columns(
+            pl.when(pl.col("_nh_name").is_not_null())
+            .then(polars_is_risk_warning_name(pl.col("_nh_name")))
+            .otherwise(pl.col("_is_st"))
+            .alias("_is_st"),
+        )
+        .drop("_nh_date", "_nh_name")
+        .sort(["symbol", "date"])
+    )
+
+
 def _load_recent_history(enriched_base: Path, symbols: list[str], days: int) -> pl.DataFrame:
     """从已有 enriched parquet 加载最近 N 天的历史数据(用于增量模式的指标计算窗口)。
 
@@ -2352,6 +2425,9 @@ def _compute_limit_signals_today(df: pl.DataFrame, instruments: pl.DataFrame) ->
     inst_subset = _attach_no_limit_window(inst_subset)
 
     df = df.join(inst_subset, on="symbol", how="left", suffix="_inst")
+    if "name" in instruments.columns:
+        # 与盘后路径同口径: ST 档位按行日期回溯名称历史
+        df = _apply_name_history_st(df, load_name_history())
 
     # 换手率: API 有则直接用, 无则从 float_shares 计算
     if "turnover_rate" not in df.columns:
