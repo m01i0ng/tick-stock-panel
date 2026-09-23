@@ -65,6 +65,28 @@ def test_full_rebuild_overwrites_existing_partitions_without_deleting_base(tmp_p
     )["close"].to_list() == [15.0]
 
 
+def test_full_rebuild_uses_current_instruments_with_name_history(tmp_path, monkeypatch):
+    _write_daily(tmp_path, "2026-07-15", 15.0)
+    inst_dir = tmp_path / "instruments"
+    inst_dir.mkdir()
+    pl.DataFrame({
+        "symbol": ["600000.SH"], "name": ["浦发银行"], "code": ["600000"],
+    }).write_parquet(inst_dir / "instruments.parquet")
+    pl.DataFrame({
+        "as_of": [date(2026, 7, 14)], "symbol": ["600000.SH"],
+        "name": ["ST浦发银行"],
+    }).write_parquet(inst_dir / "name_history.parquet")
+    received = []
+
+    def capture_instruments(raw, **kwargs):
+        received.append(kwargs["instruments"].select("symbol", "name").to_dicts())
+        return _fake_compute_enriched(raw)
+
+    monkeypatch.setattr(pipeline, "compute_enriched", capture_instruments)
+    assert pipeline.run_pipeline(data_dir=tmp_path) == 1
+    assert received == [[{"symbol": "600000.SH", "name": "浦发银行"}]]
+
+
 def test_full_rebuild_rejects_missing_existing_dates_before_writing(tmp_path, monkeypatch):
     _write_daily(tmp_path, "2026-07-15", 15.0)
     _write_existing(tmp_path, "2026-07-14", 14.0)

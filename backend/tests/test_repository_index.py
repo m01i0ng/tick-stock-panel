@@ -1,4 +1,5 @@
 """指数资产路由 — repository 层测试。"""
+import datetime as _dt
 import os
 
 import polars as pl
@@ -83,7 +84,39 @@ def test_name_map_cache_invalidated_on_instruments_refresh(repo):
     assert repo.get_name_map(["301999.SZ"]) == {"301999.SZ": "新股股份"}
 
 
-import datetime as _dt
+def test_stock_instruments_excludes_name_history_from_cache_and_views(tmp_path):
+    """名称历史与主维表共用目录时只读取主维表"""
+    inst_dir = tmp_path / "instruments"
+    inst_dir.mkdir()
+    pl.DataFrame({
+        "symbol": ["600000.SH"], "name": ["浦发银行"],
+        "code": ["600000"], "exchange": ["SH"],
+    }).write_parquet(inst_dir / "instruments.parquet")
+    pl.DataFrame({
+        "as_of": ["2026-08-14"], "symbol": ["600000.SH"],
+        "name": ["ST浦发银行"],
+    }).write_parquet(inst_dir / "name_history.parquet")
+
+    repo = KlineRepository(DataStore(tmp_path))
+    repo._refresh_instruments()
+    assert repo.get_instruments().select("symbol", "name").to_dicts() == [
+        {"symbol": "600000.SH", "name": "浦发银行"},
+    ]
+    assert repo.execute_all("SELECT symbol, name FROM instruments") == [
+        ("600000.SH", "浦发银行"),
+    ]
+
+    repo.rebuild_views()
+    assert repo.execute_all("SELECT symbol, name FROM instruments") == [
+        ("600000.SH", "浦发银行"),
+    ]
+
+    from app.jobs.daily_pipeline import _refresh_instruments_view
+
+    _refresh_instruments_view(repo)
+    assert repo.execute_all("SELECT symbol, name FROM instruments") == [
+        ("600000.SH", "浦发银行"),
+    ]
 
 
 def test_execute_one_releases_parquet_file(repo):

@@ -73,7 +73,7 @@ def _refresh_single_view(repo: KlineRepository, name: str) -> None:
         "kline_enriched": f"{d}/kline_daily_enriched/**/*.parquet",
         "kline_minute": f"{d}/kline_minute/**/*.parquet",
         "adj_factor": f"{d}/adj_factor/**/*.parquet",
-        "instruments": f"{d}/instruments/**/*.parquet",
+        "instruments": f"{d}/instruments/instruments.parquet",
     }
     path = paths.get(name)
     if not path:

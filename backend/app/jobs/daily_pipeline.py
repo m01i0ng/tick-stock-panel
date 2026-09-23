@@ -804,7 +804,7 @@ def _refresh_single_view(repo: KlineRepository, name: str) -> None:
         "kline_minute": f"{d}/kline_minute/**/*.parquet",
         "adj_factor": f"{d}/adj_factor/**/*.parquet",
         "adj_factor_etf": f"{d}/adj_factor_etf/**/*.parquet",
-        "instruments": f"{d}/instruments/**/*.parquet",
+        "instruments": f"{d}/instruments/instruments.parquet",
         "instruments_index": f"{d}/instruments_index/**/*.parquet",
         "instruments_etf": f"{d}/instruments_etf/**/*.parquet",
     }
@@ -831,7 +831,7 @@ def _refresh_instruments_view(repo: KlineRepository) -> None:
     try:
         repo.db.execute(
             f"CREATE OR REPLACE VIEW instruments AS "
-            f"SELECT * FROM read_parquet('{d}/instruments/**/*.parquet', union_by_name=true)"
+            f"SELECT * FROM read_parquet('{d}/instruments/instruments.parquet', union_by_name=true)"
         )
     except Exception as e:  # noqa: BLE001
         logger.warning("refresh instruments view failed: %s", e)

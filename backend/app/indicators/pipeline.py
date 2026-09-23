@@ -1592,7 +1592,7 @@ def run_pipeline(data_dir: Path | None = None,
     daily_dir = d / "kline_daily"
     enriched_base = d / "kline_daily_enriched"
     factor_path = d / "adj_factor" / "all.parquet"
-    inst_glob = str(d / "instruments" / "**" / "*.parquet")
+    inst_glob = str(d / "instruments" / "instruments.parquet")
 
     if not daily_dir.exists() or not any(daily_dir.rglob("*.parquet")):
         logger.info("无日K数据, 跳过管道")
