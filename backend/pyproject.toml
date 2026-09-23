@@ -40,6 +40,8 @@ dependencies = [
     # Watchlist screenshot OCR (Tesseract)
     "pytesseract>=0.3.10",
     "Pillow>=10.0",
+    # 指数页缠论。导入失败时分析模块回退内置简化分型，不阻断启动。
+    "czsc==1.0.1",
 ]
 
 [project.optional-dependencies]
@@ -55,11 +57,6 @@ legacy-cpu = [
 # 启用:`uv sync --extra backtest`
 backtest = [
     "vectorbt>=0.26",
-]
-
-# 缠论核心是可选能力；未安装时指数页使用内置轻量回退，不影响主流程。
-chan = [
-    "czsc==1.0.1",
 ]
 
 # 桌面客户端依赖: pywebview 桌面窗口。打包用 (PyInstaller), 生产/Docker 不需要。

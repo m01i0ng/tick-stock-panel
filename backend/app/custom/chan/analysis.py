@@ -11,7 +11,7 @@ import polars as pl
 
 try:
     import czsc as _czsc
-except ImportError:  # 可选 extra; 默认安装保持轻量
+except ImportError:
     _czsc = None
 
 
@@ -196,8 +196,10 @@ def _analyze_bars(
 
 
 def _alignment(levels: list[dict[str, Any]]) -> str:
-    directions = [level["direction"] for level in levels]
-    return directions[0] if directions and "flat" not in directions and len(set(directions)) == 1 else "mixed"
+    directions = [level["direction"] for level in levels if level["direction"] != "flat"]
+    if not directions or len(set(directions)) != 1:
+        return "mixed"
+    return directions[0]
 
 
 def resample_minute(df: pl.DataFrame, period: int) -> pl.DataFrame:

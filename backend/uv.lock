@@ -9,10 +9,10 @@ resolution-markers = [
     "python_full_version == '3.14.*' and sys_platform == 'emscripten'",
     "python_full_version == '3.14.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version == '3.13.*' and sys_platform == 'win32'",
-    "python_full_version < '3.13' and sys_platform == 'win32'",
     "python_full_version == '3.13.*' and sys_platform == 'emscripten'",
-    "python_full_version < '3.13' and sys_platform == 'emscripten'",
     "python_full_version == '3.13.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version < '3.13' and sys_platform == 'win32'",
+    "python_full_version < '3.13' and sys_platform == 'emscripten'",
     "python_full_version < '3.13' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 
@@ -2754,6 +2754,7 @@ version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "apscheduler" },
+    { name = "czsc" },
     { name = "duckdb" },
     { name = "fastapi" },
     { name = "fastexcel" },
@@ -2784,9 +2785,6 @@ dependencies = [
 backtest = [
     { name = "vectorbt" },
 ]
-chan = [
-    { name = "czsc" },
-]
 desktop = [
     { name = "pywebview" },
 ]
@@ -2803,7 +2801,7 @@ legacy-cpu = [
 [package.metadata]
 requires-dist = [
     { name = "apscheduler", specifier = ">=3.10" },
-    { name = "czsc", marker = "extra == 'chan'", specifier = "==1.0.1" },
+    { name = "czsc", specifier = "==1.0.1" },
     { name = "duckdb", specifier = ">=1.0" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "fastexcel", specifier = ">=0.10" },
@@ -2836,7 +2834,7 @@ requires-dist = [
     { name = "vectorbt", marker = "extra == 'backtest'", specifier = ">=0.26" },
     { name = "winotify", marker = "sys_platform == 'win32'", specifier = ">=1.1" },
 ]
-provides-extras = ["legacy-cpu", "backtest", "chan", "desktop", "dev"]
+provides-extras = ["legacy-cpu", "backtest", "desktop", "dev"]
 
 [[package]]
 name = "tqdm"

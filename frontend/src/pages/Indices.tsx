@@ -117,6 +117,7 @@ export function Indices() {
     queryKey: QK.indexChan(selectedSymbol, range.start, range.end),
     queryFn: () => api.indexChan(selectedSymbol, range),
     enabled: !!selectedSymbol && showChan,
+    placeholderData: (prev) => (prev?.symbol === selectedSymbol ? prev : undefined),
   })
 
   const isMinuteChan = chanLevel.endsWith('f')
@@ -124,6 +125,7 @@ export function Indices() {
     queryKey: QK.indexChanMinute(selectedSymbol, 45),
     queryFn: () => api.indexChanMinute(selectedSymbol, 45),
     enabled: !!selectedSymbol && showChan && isMinuteChan && hasMinuteCap,
+    placeholderData: (prev) => (prev?.symbol === selectedSymbol ? prev : undefined),
   })
 
   const activeAnalysis = isMinuteChan ? minuteChan.data : chan.data
@@ -142,6 +144,7 @@ export function Indices() {
       qc.invalidateQueries({ queryKey: QK.indexQuotes })
       qc.invalidateQueries({ queryKey: ['index-daily'] })
       qc.invalidateQueries({ queryKey: ['index-chan'] })
+      qc.invalidateQueries({ queryKey: ['index-chan-minute'] })
     },
   })
 
@@ -155,9 +158,11 @@ export function Indices() {
   const selectedQuotePct = selectedQuote?.change_pct ?? selectedQuote?.pct
 
   const chartRows = useMemo(() => toOHLC(daily.data?.rows ?? []), [daily.data?.rows])
+  const chanBarsPending = showChan && chanLevel !== 'daily' && !activeChan
+    && (isMinuteChan ? minuteChan.isFetching : chan.isFetching)
   const visibleRows = useMemo(
-    () => showChan && activeChan && chanLevel !== 'daily' ? toOHLC(activeChan.bars) : chartRows,
-    [activeChan, chanLevel, chartRows, showChan],
+    () => chanBarsPending ? [] : (showChan && activeChan && chanLevel !== 'daily' ? toOHLC(activeChan.bars) : chartRows),
+    [activeChan, chanBarsPending, chanLevel, chartRows, showChan],
   )
   const chanLines = useMemo<ChartPolyline[]>(() => {
     if (!showChan || !activeChan?.pens.length) return []
@@ -243,7 +248,7 @@ export function Indices() {
         </div>
       </div>
 
-      <div className="grid grid-cols-[15rem_1fr] gap-4">
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-[15rem_1fr]">
         <aside className="rounded-card border border-border bg-surface p-3">
           <div className="mb-2 px-1 text-[11px] uppercase tracking-wider text-muted">核心指数</div>
           <div className="space-y-1">
@@ -319,7 +324,7 @@ export function Indices() {
             {showChan && activeAnalysis && (
               <span className="xl:ml-auto text-muted">
                 {activeAnalysis.alignment === 'up' ? '多级别共振向上' : activeAnalysis.alignment === 'down' ? '多级别共振向下' : '多级别方向分化'}
-                {' · '}{activeAnalysis.engine.startsWith('czsc-') ? activeAnalysis.engine : '内置引擎'}
+                {' · '}{activeAnalysis.engine.startsWith('czsc-') ? activeAnalysis.engine : '内置简化分型'}
               </span>
             )}
           </div>
@@ -331,6 +336,7 @@ export function Indices() {
               暂无日K数据。可以先同步指数日K，或选择其他指数。
             </div>
           )}
+          {chanBarsPending && <div className="py-10 text-center text-sm text-muted">缠论结构加载中…</div>}
           {visibleRows.length > 0 && (
             <div className="flex flex-col items-stretch gap-3 xl:flex-row xl:items-start">
               <div className="min-w-0 flex-1">

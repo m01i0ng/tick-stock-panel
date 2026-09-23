@@ -1,7 +1,7 @@
 """缠论分析路由: /api/custom/chan (日/周/月) 与 /api/custom/chan/minute (分钟级)。"""
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Annotated
 
 import polars as pl
@@ -10,6 +10,8 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from app.custom.chan import analysis
 from app.market_time import cn_now
 from app.services import kline_sync
+
+_MINUTE_PERIODS = (1, 5, 10, 15, 30, 60, 120)
 
 
 def get_index_chan(
@@ -27,26 +29,64 @@ def get_index_chan(
     return analysis.analyze_levels(df, symbol)
 
 
+def _minute_window_start(repo, symbol: str, end: datetime, trading_days: int) -> datetime:
+    """往回取 trading_days 个指数交易日。本地日K不够时按 7/5 换算自然日。"""
+    span = int(trading_days * 7 / 5) + 10
+    fallback = end - timedelta(days=span)
+    if repo is None or not hasattr(repo, "get_index_daily"):
+        return fallback
+    try:
+        daily = repo.get_index_daily(symbol, fallback.date(), end.date(), columns=["date"])
+    except Exception:
+        return fallback
+    if daily.is_empty() or "date" not in daily.columns:
+        return fallback
+    dates = daily.get_column("date").drop_nulls().unique().sort()
+    if dates.len() == 0:
+        return fallback
+    picked = dates.item(-min(trading_days, dates.len()))
+    return datetime.combine(picked, time.min, tzinfo=end.tzinfo)
+
+
 def get_index_chan_minute(
     request: Request,
     symbol: Annotated[str, Query(description="指数代码, 如 000001.SH")],
     days: Annotated[int, Query(ge=5, le=120)] = 45,
 ):
-    """返回 1F~120F 缠论;直取失败时从最近可整除的较小周期合成。"""
+    """返回 1F~120F 缠论。优先本地 1 分钟, 否则从最细可直取周期各合成一次。"""
     end = cn_now()
-    start = end - timedelta(days=days)
+    repo = getattr(request.app.state, "repo", None)
+    start = _minute_window_start(repo, symbol, end, days)
+    capset = getattr(request.app.state, "capabilities", None)
+    local = pl.DataFrame()
+    if repo is not None and hasattr(repo, "get_minute_range"):
+        try:
+            local = repo.get_minute_range([symbol], start.date(), end.date(), asset_type="index")
+        except Exception:
+            local = pl.DataFrame()
+
     frames: dict[int, tuple[pl.DataFrame, str, str]] = {}
-    for period in (1, 5, 10, 15, 30, 60, 120):
-        direct = kline_sync.fetch_minute_period(symbol, start, end, period, "index")
-        if not direct.is_empty():
-            frames[period] = (direct, "direct", f"{period}F")
+    base_period: int | None = None
+    base_df: pl.DataFrame | None = None
+    if not local.is_empty():
+        base_period, base_df = 1, local
+    for period in _MINUTE_PERIODS:
+        if base_df is not None and base_period is not None and period % base_period == 0:
+            if period == base_period:
+                frames[period] = (base_df, "direct", f"{period}F")
+            else:
+                frames[period] = (
+                    analysis.resample_minute(base_df, period), "synthetic", f"{base_period}F",
+                )
             continue
-        candidates = [source for source, (df, _, _) in frames.items() if not df.is_empty() and period % source == 0]
-        if not candidates:
+        direct = kline_sync.fetch_minute_period(
+            symbol, start, end, period, "index", capset=capset,
+        )
+        if direct.is_empty():
             frames[period] = (pl.DataFrame(), "none", "--")
             continue
-        source = max(candidates)
-        frames[period] = (analysis.resample_minute(frames[source][0], period), "synthetic", f"{source}F")
+        base_period, base_df = period, direct
+        frames[period] = (direct, "direct", f"{period}F")
     return analysis.analyze_minute_levels(frames, symbol)
 
 

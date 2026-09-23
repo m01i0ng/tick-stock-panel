@@ -10,8 +10,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from app.custom.chan import analysis as chan_analysis
-from app.custom.chan.routes import get_index_chan, get_index_chan_minute
+from app.custom.chan.routes import _minute_window_start, get_index_chan, get_index_chan_minute
 from app.extensions.loader import configure_backend_extensions
+from app.market_time import CN_TZ
 
 
 def _sample(rows: int = 1200) -> pl.DataFrame:
@@ -68,8 +69,7 @@ def test_analyze_levels_rejects_missing_ohlc():
         chan_analysis.analyze_levels(pl.DataFrame({"date": [date.today()], "open": [1], "low": [1], "close": [1]}), "X")
 
 
-@pytest.mark.skipif(chan_analysis._czsc is None, reason="czsc extra 未安装")
-def test_analyze_levels_uses_czsc_when_installed():
+def test_analyze_levels_uses_czsc():
     result = chan_analysis.analyze_levels(_sample(500), "000001.SH")
 
     assert result["engine"].startswith("czsc-")
@@ -105,29 +105,91 @@ def test_resample_minute_respects_cn_sessions():
     assert result["volume"].to_list() == [1210.0, 1200.0]
 
 
-def test_index_chan_minute_uses_nearest_divisible_level(monkeypatch):
+def test_index_chan_minute_resamples_from_finest_direct(monkeypatch):
     monkeypatch.setattr(chan_analysis, "_czsc", None)
     one_minute = _minute_sample()
-    five_minute = chan_analysis.resample_minute(one_minute, 5)
+    called: list[int] = []
 
-    def fake_fetch(symbol, start_time, end_time, period, asset_type):
+    def fake_fetch(symbol, start_time, end_time, period, asset_type, capset=None):
         assert symbol == "000001.SH"
         assert asset_type == "index"
-        return {1: one_minute, 5: five_minute}.get(period, pl.DataFrame())
+        assert capset == "cap"
+        called.append(period)
+        return one_minute if period == 1 else pl.DataFrame()
+
+    monkeypatch.setattr("app.services.kline_sync.fetch_minute_period", fake_fetch)
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(capabilities="cap")))
+
+    result = get_index_chan_minute(request, "000001.SH", 45)
+
+    assert called == [1]
+    assert [level["key"] for level in result["levels"]] == ["1f", "5f", "10f", "15f", "30f", "60f", "120f"]
+    assert [(level["source"], level["source_period"]) for level in result["levels"]] == [
+        ("direct", "1F"),
+        *([("synthetic", "1F")] * 6),
+    ]
+    assert result["levels"][-1]["bars"][-2]["date"].endswith("11:30")
+    assert result["levels"][-1]["bars"][-1]["date"].endswith("15:00")
+
+
+def test_index_chan_minute_falls_back_to_coarser_direct(monkeypatch):
+    monkeypatch.setattr(chan_analysis, "_czsc", None)
+    five_minute = chan_analysis.resample_minute(_minute_sample(), 5)
+    called: list[int] = []
+
+    def fake_fetch(symbol, start_time, end_time, period, asset_type, capset=None):
+        called.append(period)
+        return five_minute if period == 5 else pl.DataFrame()
 
     monkeypatch.setattr("app.services.kline_sync.fetch_minute_period", fake_fetch)
     request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
 
     result = get_index_chan_minute(request, "000001.SH", 45)
 
-    assert [level["key"] for level in result["levels"]] == ["1f", "5f", "10f", "15f", "30f", "60f", "120f"]
-    assert [(level["source"], level["source_period"]) for level in result["levels"]] == [
-        ("direct", "1F"), ("direct", "5F"), ("synthetic", "5F"),
-        ("synthetic", "5F"), ("synthetic", "15F"),
-        ("synthetic", "30F"), ("synthetic", "60F"),
+    assert called == [1, 5]
+    assert [(level["source"], level["source_period"]) for level in result["levels"] if level["key"] != "1f"] == [
+        ("direct", "5F"),
+        *([("synthetic", "5F")] * 5),
     ]
-    assert result["levels"][-1]["bars"][-2]["date"].endswith("11:30")
-    assert result["levels"][-1]["bars"][-1]["date"].endswith("15:00")
+
+
+def test_index_chan_minute_allows_custom_120f(monkeypatch):
+    monkeypatch.setattr(chan_analysis, "_czsc", None)
+    bars = chan_analysis.resample_minute(_minute_sample(1), 120)
+    called: list[int] = []
+
+    def fake_fetch(symbol, start_time, end_time, period, asset_type, capset=None):
+        called.append(period)
+        return bars if period == 120 else pl.DataFrame()
+
+    monkeypatch.setattr("app.services.kline_sync.fetch_minute_period", fake_fetch)
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+
+    result = get_index_chan_minute(request, "000001.SH", 45)
+
+    assert called[-1] == 120
+    assert result["levels"][-1]["source"] == "direct"
+
+
+def test_alignment_ignores_flat_levels():
+    assert chan_analysis._alignment([
+        {"direction": "up"}, {"direction": "flat"}, {"direction": "up"},
+    ]) == "up"
+    assert chan_analysis._alignment([{"direction": "flat"}]) == "mixed"
+    assert chan_analysis._alignment([
+        {"direction": "up"}, {"direction": "down"},
+    ]) == "mixed"
+
+
+def test_minute_window_uses_index_sessions():
+    sessions = [date(2026, 8, 3) + timedelta(days=i) for i in range(10)]
+    repo = SimpleNamespace(get_index_daily=lambda symbol, start, end, columns=None: pl.DataFrame({"date": sessions}))
+    end = datetime(2026, 8, 12, 10, 0, tzinfo=CN_TZ)
+
+    start = _minute_window_start(repo, "000001.SH", end, 3)
+
+    assert start.date() == sessions[-3]
+    assert start.tzinfo == CN_TZ
 
 
 def test_extension_registers_routes_via_loader() -> None:
