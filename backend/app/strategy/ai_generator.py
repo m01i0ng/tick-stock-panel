@@ -413,6 +413,17 @@ META = {{...}}，{entrypoint_requirement}。只输出完整 Python 代码。
                 if isinstance(sl, ast.Constant) and isinstance(sl.value, str) \
                         and sl.value in forbidden_subscript_strs:
                     raise ValueError(f"禁止下标访问 {sl.value} (策略不允许 dunder 遍历逃逸)")
+            # 拦截对 META 字典的下标写: exec 时会覆盖字典值 (如 research_only),
+            # 绕过发布闸; 元信息只允许以顶层字面量字典声明
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for target in targets:
+                    if isinstance(target, ast.Subscript) \
+                            and isinstance(target.value, ast.Name) \
+                            and target.value.id in _META_NAMES:
+                        raise ValueError(
+                            f"禁止对 {target.value.id} 做下标赋值 (元信息只能以顶层字面量字典声明)"
+                        )
 
     @staticmethod
     def _extract_meta(code: str) -> dict:

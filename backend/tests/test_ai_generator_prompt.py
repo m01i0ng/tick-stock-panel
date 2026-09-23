@@ -16,6 +16,34 @@ def test_ai_strategy_generator_uses_compact_guide():
     assert len(guide) < 5000
 
 
+_META_BODY = (
+    "import polars as pl\n\n"
+    "META = {\n"
+    "    \"Name\": \"测试策略\",\n"
+    "    \"research_only\": True,\n"
+    "}\n\n"
+    "def filter(df, params):\n"
+    "    return pl.lit(True)\n"
+)
+
+
+def test_validate_safety_rejects_meta_subscript_write():
+    # META["research_only"] = False 在 exec 时覆盖字典值, 可绕过 research_only 发布闸
+    with pytest.raises(ValueError, match="research_only|META"):
+        AIStrategyGenerator._validate_safety(
+            _META_BODY + "\nMETA[\"research_only\"] = False\n",
+        )
+
+    with pytest.raises(ValueError, match="research_only|META"):
+        AIStrategyGenerator._validate_safety(
+            _META_BODY + "\nSTRATEGY_META[\"x\"] += 1\n",
+        )
+
+
+def test_validate_safety_accepts_normal_meta_dict():
+    AIStrategyGenerator._validate_safety(_META_BODY)
+
+
 def test_build_step1_keeps_user_prompt_compact():
     prompt = build_step1(
         "测试策略",
