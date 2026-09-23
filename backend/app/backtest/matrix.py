@@ -26,7 +26,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as pads
 
-from app.backtest.minute_trigger import build_minute_exit_reference
+from app.backtest.minute_trigger import build_minute_entry_reference, build_minute_exit_reference
 from app.backtest.numba_runtime import run_numba_parallel
 from app.price_limits import (
     MAIN_BOARD_ST_LIMIT_CHANGE_DATE,
@@ -2414,6 +2414,7 @@ def build_market_matrix(
     entry_signal_ids: list[str] | None = None,
     exit_signal_ids: list[str] | None = None,
     minute_exit_trigger: bool = False,
+    minute_entry_reference: bool = False,
 ) -> MarketMatrix:
     """Backward-compatible long-panel boundary used by legacy/Polars strategies."""
     if panel.is_empty():
@@ -2452,11 +2453,19 @@ def build_market_matrix(
         entry_signal_ids=normalized_entry_ids,
         exit_signal_ids=normalized_exit_ids,
     )
+    # 分钟穿越参考线必须剔除当根收盘 (盘中开盘即已知), 默认回退链 ma5 含当根
+    # 收盘属前视, 仅作为无 close 场景的兜底保留
+    reference_price = (
+        build_minute_entry_reference(market.close)
+        if minute_entry_reference
+        else None
+    )
     return build_market_matrix_from_signals(
         market,
         signals,
         entry_delay_bars=entry_delay_bars,
         exit_delay_bars=exit_delay_bars,
+        reference_price=reference_price,
         minute_exit_trigger=minute_exit_trigger,
     )
 

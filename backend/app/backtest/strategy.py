@@ -1621,6 +1621,7 @@ class StrategyBacktestService:
                 entry_signal_ids=entry_signals,
                 exit_signal_ids=exit_signals,
                 minute_exit_trigger=matcher_config.exit_fill == "signal_next_minute",
+                minute_entry_reference=matcher_config.minute_fill,
             )
             timing_ms["matrix_build"] = round((time.perf_counter() - t_matrix) * 1000, 1)
             del panel, sim_panel, sim_entry_mask, sim_exit_mask

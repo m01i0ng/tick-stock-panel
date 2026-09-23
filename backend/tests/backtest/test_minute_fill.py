@@ -13,7 +13,7 @@
 """
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import numpy as np
 import polars as pl
@@ -149,6 +149,49 @@ def test_minute_entry_reference_removes_current_close():
     close = np.array([*base, 10.0], dtype=np.float64).reshape(-1, 1)
     result = build_minute_entry_reference(close)
     assert np.isnan(result[:4]).all()  # 不足窗口的行 → NaN → 退化 VWAP
+
+
+def test_panel_market_matrix_reference_excludes_current_close():
+    """非矩阵策略的分钟穿越参考线也不得含当日收盘 (与 matrix_native 同纪律)。
+
+    build_market_matrix 无参考线时回退 ma5/ma10/ma20 字段 — rolling 含当根
+    收盘, 盘中穿越判定使用 15:00 才确定的价格 (前视)。开启
+    minute_entry_reference 后参考线应为前 window-1 根收盘均值。
+    """
+    from app.backtest.matrix import build_market_matrix
+
+    close = [10.0, 10.0, 10.0, 10.0, 9.0, 11.0]
+    ma5 = [None, None, None, None, 9.8, 10.0]
+    n = len(close)
+    panel = pl.DataFrame({
+        "symbol": ["000001.SZ"] * n,
+        "date": [date(2024, 1, 1) + timedelta(days=i) for i in range(n)],
+        "open": close,
+        "high": close,
+        "low": close,
+        "close": close,
+        "score": [1.0] * n,
+        "ma5": ma5,
+        "ma10": ma5,
+        "ma20": ma5,
+    })
+    entries = pl.Series("entry", [False] * n, dtype=pl.Boolean)
+    exits = pl.Series("exit", [False] * n, dtype=pl.Boolean)
+
+    causal = build_market_matrix(
+        panel, entries, exits, minute_entry_reference=True,
+    ).reference_price
+    legacy = build_market_matrix(panel, entries, exits).reference_price
+
+    # 因果参考线 = 前 4 日收盘均值, 与当日收盘无关
+    # row4: mean(10,10,10,10)=10.0; row5: mean(10,10,10,9)=9.75
+    assert causal[4, 0] == pytest.approx(10.0)
+    assert causal[5, 0] == pytest.approx(9.75)
+    assert np.isnan(causal[:4, 0]).all()
+    # 旧回退链参考线 = ma5 本身, 含当根收盘
+    # row4: mean(…,9)=9.8; row5: mean(…,11)=10.0 — 两者都随当日收盘漂移
+    assert legacy[4, 0] == pytest.approx(9.8)
+    assert legacy[5, 0] == pytest.approx(10.0)
 
 
 def test_minute_fill_price_independent_of_current_close():
