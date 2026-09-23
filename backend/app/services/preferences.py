@@ -80,16 +80,9 @@ def get_realtime_quotes_enabled() -> bool:
     return load().get("realtime_quotes_enabled", False)
 
 
-def get_realtime_watchlist_symbols() -> list[str]:
-    """自选实时标的代码列表。默认空列表。"""
-    return list(load().get("realtime_watchlist_symbols", []))
-
-
-def set_realtime_watchlist_symbols(symbols: list[str]) -> list[str]:
-    """保存自选实时标的代码列表。"""
-    cleaned = [str(s).strip() for s in symbols if str(s).strip()]
-    save({"realtime_watchlist_symbols": cleaned})
-    return cleaned
+def realtime_quotes_explicitly_set() -> bool:
+    """用户是否写过实时行情开关。缺键可在交易时段自动打开, disable() 写入 false 后保持关闭。"""
+    return "realtime_quotes_enabled" in load()
 
 
 def get_watchlist_groups_in_nav() -> bool:

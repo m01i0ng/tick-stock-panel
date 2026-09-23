@@ -1,11 +1,13 @@
 """启动时交易时段自动开启实时行情 (QuoteService.boot_check)。
 
-需求: 程序启动时判断是否交易时间, 是则自动开启实时行情 (免手动点开关)。
+需求: 从未写过开关时, 若处于交易时间则自动开启 (免手动点开关)。
+用户一旦 disable(), preferences 里有 false, 重启保持关闭。
 
 关键边界:
 - 时段判据必须是连续竞价 (_is_continuous_trading, 与 status.is_trading_hours 同口径)。
   不能用 _is_trading_hours: 它是轮询窗口, 收盘定版未完成时工作日夜间也为真, 会在半夜自动开启。
-- none 档无实时权限、watchlist 模式未配置自选标的时不自动开启 (与手动开启门禁一致)。
+- 交易日探针明确休市时不自动开启。探针未知时仍按周几近似。
+- none 档无实时权限时不自动开启。
 - 开关已开启时行为不变 (与时段无关照常启动)。
 """
 from __future__ import annotations
@@ -34,19 +36,23 @@ def _run_boot_check(
     *,
     weekday: int = 0,
     prefs_enabled: bool = False,
+    explicit: bool = False,
+    trading: bool | None = None,
     mode: str = "full_market",
-    watchlist: tuple[str, ...] = (),
 ):
     """在固定北京时刻 + 固定档位/开关下执行 boot_check。
 
     返回 (start_mock, save_enabled_mock): start 被拦下, 不真启轮询线程 (无网络请求)。
+    explicit=False 表示 preferences 里还没有开关键。
+    trading=None 表示交易日探针未知, 退回周几近似。
     """
     with ExitStack() as stack:
         enter = stack.enter_context
         enter(patch.object(qs_module, "cn_now", _cn_now_at(hour, minute, weekday)))
         enter(patch.object(QuoteService, "realtime_mode", classmethod(lambda cls: mode)))
         enter(patch.object(prefs, "get_realtime_quotes_enabled", return_value=prefs_enabled))
-        enter(patch.object(prefs, "get_realtime_watchlist_symbols", return_value=list(watchlist)))
+        enter(patch.object(prefs, "realtime_quotes_explicitly_set", return_value=explicit))
+        enter(patch("app.services.trading_day.is_trading_day", return_value=trading))
         start = enter(patch.object(QuoteService, "start"))
         save = enter(patch.object(QuoteService, "_save_enabled"))
         QuoteService().boot_check()
@@ -105,7 +111,19 @@ def test_weekend_does_not_auto_enable():
     assert start.call_count == 0
 
 
-# ── 权限 / 标的门禁 ───────────────────────────────────────────────────
+def test_user_disabled_does_not_auto_enable():
+    """用户已写入关闭后, 交易时段重启保持关闭。"""
+    start, _ = _run_boot_check(10, 30, explicit=True)
+    assert start.call_count == 0
+
+
+def test_confirmed_holiday_does_not_auto_enable():
+    """工作日但探针判定休市 → 不自动开启, 也不把开关写成开。"""
+    start, _ = _run_boot_check(10, 30, trading=False)
+    assert start.call_count == 0
+
+
+# ── 权限门禁 ─────────────────────────────────────────────────────────
 def test_none_tier_does_not_auto_enable():
     """none 档无实时权限, 交易时段也不自动开启。"""
     start, _ = _run_boot_check(10, 30, mode="none")
@@ -117,17 +135,6 @@ def test_none_tier_forces_pref_off():
     start, save = _run_boot_check(10, 30, mode="none", prefs_enabled=True)
     assert start.call_count == 0
     save.assert_called_once_with(False)
-
-
-def test_watchlist_mode_without_symbols_does_not_auto_enable():
-    """watchlist 模式未配置自选标的 → 不自动开启 (与手动开启 watchlist_empty 门禁一致)。"""
-    start, _ = _run_boot_check(10, 30, mode="watchlist")
-    assert start.call_count == 0
-
-
-def test_watchlist_mode_with_symbols_auto_enables():
-    start, _ = _run_boot_check(10, 30, mode="watchlist", watchlist=("600000.SH",))
-    assert start.call_count == 1
 
 
 # ── 开关已开启: 原有行为不变 ──────────────────────────────────────────
@@ -146,6 +153,8 @@ def test_auto_enable_persists_enabled_flag():
         enter(patch.object(qs_module, "cn_now", _cn_now_at(10, 30)))
         enter(patch.object(QuoteService, "realtime_mode", classmethod(lambda cls: "full_market")))
         enter(patch.object(prefs, "get_realtime_quotes_enabled", return_value=False))
+        enter(patch.object(prefs, "realtime_quotes_explicitly_set", return_value=False))
+        enter(patch("app.services.trading_day.is_trading_day", return_value=None))
         enter(patch.object(prefs, "get_realtime_quote_interval", return_value=6.0))
         # 轮询体置空: 线程立即退出, 不发网络请求
         enter(patch.object(QuoteService, "_poll_loop", lambda self: None))
