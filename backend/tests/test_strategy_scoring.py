@@ -40,6 +40,37 @@ def test_scoring_reweights_only_available_fields():
     assert scored["score"].to_list() == pytest.approx([100.0, 0.0])
 
 
+def test_null_scoring_input_falls_back_to_zero_like_backtest():
+    # 次新股长窗口因子为 null 时, 选股评分应与回测口径一致置 0, 而不是 null 排序挤占榜首
+    df = pl.DataFrame({
+        "symbol": ["A", "B", "C"],
+        "date": [date(2024, 1, 2)] * 3,
+        "close": [11.0, 12.0, 13.0],
+        "ma20": [10.0, 10.0, 10.0],
+        "vol_ratio_5d": [2.0, 1.0, None],
+    })
+    weights = {"ma20_bias": 0.6, "vol_ratio_5d": 0.4}
+    realtime = StrategyEngine._apply_scoring(df, weights)
+    strategy = SimpleNamespace(meta={"scoring": weights, "order_by": "score"})
+    backtest = StrategyBacktestService._apply_score(df, strategy, None)
+
+    assert realtime["score"].to_list() == pytest.approx([40.0, 30.0, 0.0])
+    assert backtest["score"].to_list() == pytest.approx([40.0, 30.0, 0.0])
+
+
+def test_sort_places_null_score_rows_last():
+    df = pl.DataFrame({
+        "symbol": ["NULLROW", "HIGH", "LOW"],
+        "score": [None, 90.0, 10.0],
+    })
+
+    sorted_desc = StrategyEngine._sort_for_results(df, "score", descending=True)
+    sorted_asc = StrategyEngine._sort_for_results(df, "score", descending=False)
+
+    assert sorted_desc["symbol"].to_list() == ["HIGH", "LOW", "NULLROW"]
+    assert sorted_asc["symbol"].to_list() == ["LOW", "HIGH", "NULLROW"]
+
+
 def test_scoring_can_prefer_lower_factor_values():
     scored = StrategyEngine._apply_scoring(
         _candidates(),

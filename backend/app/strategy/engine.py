@@ -1055,11 +1055,11 @@ class StrategyEngine:
         limit = self._result_limit(s, overrides)
         order_desc = s.meta.get("descending", True)
         if "score" in df.columns:
-            df = df.sort("score", descending=order_desc)
+            df = self._sort_for_results(df, "score", order_desc)
         elif s.meta.get("order_by") and s.meta["order_by"] != "score":
             ob = s.meta["order_by"]
             if ob in df.columns:
-                df = df.sort(ob, descending=order_desc)
+                df = self._sort_for_results(df, ob, order_desc)
         if limit is not None:
             df = df.head(limit)
 
@@ -1695,6 +1695,11 @@ class StrategyEngine:
     # ================================================================
 
     @staticmethod
+    def _sort_for_results(df: pl.DataFrame, column: str, descending: bool) -> pl.DataFrame:
+        # null 排序值(数据不足等来源)一律垫底, 避免挤占 limit 头部
+        return df.sort(column, descending=descending, nulls_last=True)
+
+    @staticmethod
     def _apply_scoring(
         df: pl.DataFrame,
         weights: dict,
@@ -1731,7 +1736,8 @@ class StrategyEngine:
         score_expr = score_parts[0]
         for part in score_parts[1:]:
             score_expr = score_expr + part
-        return df.with_columns((score_expr * 100).alias("score"))
+        # 数据不足(如次新股长窗口因子)产生的 null 统一按 0 分处理, 与回测口径一致
+        return df.with_columns((score_expr * 100).fill_null(0).alias("score"))
 
     @staticmethod
     def _materialize_scoring_frames(
