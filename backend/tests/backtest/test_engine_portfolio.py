@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 
 import polars as pl
+import pytest
 
 from app.backtest.engine import BacktestEngine, MatcherConfig
 
@@ -518,3 +519,50 @@ def test_minute_signal_exit_without_next_bar_falls_back_to_next_open():
     assert result.trades[0].exit_date == "2024-01-04"
     assert result.trades[0].exit_price == 8.8
     assert result.stats["execution"]["sell_minute_trigger_fallback"] == 1
+
+
+def test_delisted_position_closes_at_own_last_bar_and_frees_slot():
+    """退市/尾部缺 bar 的持仓应在资产自身末根 bar 以 "end" 平仓。
+
+    修复前组合模式只在矩阵最后一根触发 end, 退市持仓被 sell_suspended 拒绝后
+    永久挂起: 冻结估值持续占净值、仓位槽被占用阻断后续建仓、无平仓交易记录,
+    与独立候选路径 (资产末根 bar 平仓) 口径不一致。
+    """
+    start = date(2024, 1, 1)
+    rows = []
+    for sym, day_range in (("DEL", range(5)), ("NEW", range(8))):
+        for i in day_range:
+            rows.append({
+                "symbol": sym,
+                "name": sym,
+                "date": start + timedelta(days=i),
+                "open": 10.0, "high": 10.0, "low": 10.0, "close": 10.0,
+                "volume": 100_000,
+                "score": 4.0 if sym == "DEL" else 3.0,
+                "signal_limit_up": False,
+                "signal_limit_down": False,
+            })
+    panel = pl.DataFrame(rows).sort(["symbol", "date"])
+    # DEL day0 信号次日开盘买入, day4 后退市; NEW day5 信号次日买入 (单槽位)
+    entries = _mask(panel, {("DEL", 0), ("NEW", 5)})
+    exits = _mask(panel, set())
+
+    result = _engine().simulate_portfolio(
+        panel,
+        entries,
+        exits,
+        MatcherConfig(
+            entry_fill="open_t+1",
+            fees_pct=0,
+            slippage_bps=0,
+            max_positions=1,
+            initial_capital=100_000,
+        ),
+    )
+
+    assert [t.symbol for t in result.trades] == ["DEL", "NEW"]
+    del_trade = result.trades[0]
+    assert del_trade.exit_reason == "end"
+    assert del_trade.exit_date == "2024-01-05"  # 资产自身末根 bar (start+4d)
+    assert del_trade.exit_price == pytest.approx(10.0)
+    assert result.stats["pending_exit_positions"] == 0

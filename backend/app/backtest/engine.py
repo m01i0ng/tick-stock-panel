@@ -1760,6 +1760,13 @@ class BacktestEngine:
         time_count, asset_count = matrix.shape
         entry_prices = self._resolve_entry_prices(matrix, config)
         exit_prices = matrix.open if config.exit_fill == "open_t+1" else matrix.close
+        # 各资产自身最后一根有 bar 的时刻: 退市/尾部缺 bar 的持仓在资产末根平仓,
+        # 与独立候选路径同一口径, 避免持仓冻结估值永久占用仓位槽
+        asset_last_present = np.where(
+            matrix.tradable.any(axis=0),
+            time_count - 1 - np.argmax(matrix.tradable[::-1, :], axis=0),
+            -1,
+        ).astype(np.int64)
         buy_cost_pct = config.buy_cost_pct()
         sell_cost_pct = config.sell_cost_pct()
         cash = float(config.initial_capital)
@@ -1982,6 +1989,7 @@ class BacktestEngine:
             _sell(time_id, asset_id, reason, signal_date, sold_today, override)
             return True
 
+        completed = False
         for time_id, date_label in enumerate(matrix.timestamp_labels):
             date_text = date_label[:10]
             if time_id % 20 == 0:
@@ -2056,7 +2064,7 @@ class BacktestEngine:
                     signal_date = _signal_date(int(matrix.exit_signal_time[time_id, asset_id]), date_text)
                 elif config.max_hold_days is not None and pos["hold_days"] >= config.max_hold_days:
                     reason = "max_hold"
-                elif time_id == time_count - 1:
+                elif time_id == time_count - 1 or time_id == int(asset_last_present[asset_id]):
                     reason = "end"
                 if reason:
                     _try_sell(time_id, asset_id, reason, signal_date, sold_today)
@@ -2178,6 +2186,27 @@ class BacktestEngine:
                     "date": date_text,
                     "value": round(float(drawdown), 4),
                 })
+        else:
+            completed = True
+
+        # 兜底: 资产末根一字跌停无法成交、或末根当日建仓受 T+1 限制而未能在
+        # 自身末根平仓的持仓, 按冻结的末根收盘强制记一笔 end 平仓, 保证与
+        # 独立候选路径统计口径一致。按退市前最后收盘清算属保守乐观口径
+        # (现实退市整理期价格通常更低), 结果解读时应注意。
+        if completed:
+            final_sold: set[int] = set()
+            for asset_id in list(positions):
+                last_bar = int(asset_last_present[asset_id])
+                close_time = last_bar if last_bar >= 0 else time_count - 1
+                frozen = float(last_close[asset_id])
+                _sell(
+                    close_time,
+                    asset_id,
+                    "end",
+                    matrix.timestamp_labels[close_time][:10],
+                    final_sold,
+                    override=frozen if _valid_price(frozen) else None,
+                )
 
         statistics_started = time.perf_counter()
         stats = self._calc_portfolio_stats_from_values(
