@@ -1641,7 +1641,31 @@ def run_pipeline(data_dir: Path | None = None,
                 hist_cols = [c for c in ["symbol", "date", "open", "high", "low", "close",
                                          "volume", "amount", "raw_close", "raw_high", "raw_low"]
                              if c in hist_df.columns]
-                raw_full = pl.concat([hist_df.select(hist_cols), raw_new], how="diagonal_relaxed")
+                prefix = hist_df.select(hist_cols)
+                if "raw_close" in prefix.columns and "close" in prefix.columns:
+                    # enriched 落盘 OHLC 是前复权价, 必须先恢复原始价口径再喂回复权
+                    # 管线, 否则 compute_enriched 二次复权, 除权日 _prev_raw_close
+                    # 取到双重复权价导致涨停误判; raw_open 未落盘, 按 open 的复权
+                    # 比例反推 (open 不参与涨跌停判定, 指标窗口精度足够)。
+                    # 正常态 (尾行 close == raw_close) 比例为 1, 本变换为幂等。
+                    def _raw_or(name: str, raw_name: str) -> pl.Expr:
+                        if raw_name not in prefix.columns:
+                            return pl.col(name)
+                        return pl.when(pl.col(raw_name).is_not_null()).then(pl.col(raw_name)).otherwise(pl.col(name))
+
+                    ratio = (
+                        pl.when(
+                            pl.col("raw_close").is_not_null()
+                            & pl.col("close").is_not_null() & (pl.col("close") > 0),
+                        ).then(pl.col("raw_close") / pl.col("close")).otherwise(pl.lit(1.0))
+                    )
+                    prefix = prefix.with_columns(
+                        (pl.col("open") * ratio).alias("open"),
+                        _raw_or("high", "raw_high").alias("high"),
+                        _raw_or("low", "raw_low").alias("low"),
+                        _raw_or("close", "raw_close").alias("close"),
+                    )
+                raw_full = pl.concat([prefix, raw_new], how="diagonal_relaxed")
             else:
                 raw_full = raw_new
 
