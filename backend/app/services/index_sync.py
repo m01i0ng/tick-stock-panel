@@ -2,7 +2,8 @@
 
 标的列表优先用免费的 exchanges.get_instruments(type=index/etf) 拉取
 (None/Free 档均可用,无需 quote.pool 权限);付费档可额外用
-quotes.get_by_universes 作为补充来源。日K统一走 klines.batch。
+quotes.get_by_universes 作为补充来源。ETF 日K先走当前 daily provider
+(asset_type=etf), 空结果再回退 TickFlow klines.batch。
 """
 from __future__ import annotations
 
@@ -296,8 +297,16 @@ def sync_and_persist_etf_daily(
 ) -> int:
     """同步 ETF 日K到独立 kline_etf_* parquet,并计算 ETF enriched。
     on_chunk_done(current, total) 每个批次完成后回调。
+    当前 daily provider 声明了 daily 数据集时先按 asset_type=etf 拉取;
+    返回空表再回退 TickFlow(fuyao 等只支持股票日K的源因此保持原路径)。
     """
-    if not capset.has(Cap.KLINE_DAILY_BATCH):
+    from app.data_providers import custom as custom_sources
+
+    provider_name = preferences.get_daily_data_provider()
+    custom = None
+    if provider_name != "tickflow" and custom_sources.provider_has_dataset(provider_name, "daily"):
+        custom = custom_sources.get_provider(provider_name)
+    if custom is None and not capset.has(Cap.KLINE_DAILY_BATCH):
         return 0
 
     if symbols_override:
@@ -313,8 +322,11 @@ def sync_and_persist_etf_daily(
     if not symbols:
         return 0
 
-    limit = resolve_limit(capset, Cap.KLINE_DAILY_BATCH)
-    batch_size = min_batch(preferences.get_index_daily_batch_size(), limit)
+    batch_size = preferences.get_index_daily_batch_size()
+    limit = None
+    if capset.has(Cap.KLINE_DAILY_BATCH):
+        limit = resolve_limit(capset, Cap.KLINE_DAILY_BATCH)
+        batch_size = min_batch(batch_size, limit)
 
     end_time = end_date or datetime.now()
     start_time = start_date or (end_time - timedelta(days=365))
@@ -323,14 +335,22 @@ def sync_and_persist_etf_daily(
     chunks = chunked(symbols, batch_size)
     factors = _load_etf_factors(repo)
     for i, chunk in enumerate(chunks):
-        sleep_between_batches(i, limit.rpm)
-        raw = kline_sync.sync_daily_batch(
-            chunk,
-            count=count,
-            batch_size=None,
-            start_time=start_time,
-            end_time=end_time,
-        )
+        raw = pl.DataFrame()
+        if custom is not None:
+            raw = custom.get_daily(
+                chunk, start_time=start_time, end_time=end_time, asset_type="etf",
+            )
+        if raw.is_empty():
+            if limit is None:
+                continue
+            sleep_between_batches(i, limit.rpm)
+            raw = kline_sync.sync_daily_batch(
+                chunk,
+                count=count,
+                batch_size=None,
+                start_time=start_time,
+                end_time=end_time,
+            )
         if raw.is_empty():
             continue
 

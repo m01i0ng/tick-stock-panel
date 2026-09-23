@@ -164,3 +164,70 @@ def test_index_daily_default_end_is_beijing_today(monkeypatch) -> None:
     assert captured, "应查询指数日K"
     _start, end = captured[0]
     assert end == TODAY, f"窗口右端必须是北京日期 {TODAY}, 实际 {end} (服务器本地 {_date.today()})"
+
+
+def test_etf_daily_uses_custom_provider(monkeypatch):
+    from app.services import index_sync
+
+    seen: dict = {}
+
+    class _Provider:
+        def get_daily(self, symbols, start_time, end_time, asset_type="stock", on_chunk_done=None):
+            seen["asset_type"] = asset_type
+            return pl.DataFrame({
+                "symbol": list(symbols),
+                "date": [TODAY] * len(symbols),
+                "open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0],
+                "volume": [1.0], "amount": [1.0],
+            })
+
+    monkeypatch.setattr(index_sync.preferences, "get_daily_data_provider", lambda: "eltdx")
+    monkeypatch.setattr(index_sync.preferences, "get_index_daily_batch_size", lambda: 100)
+    monkeypatch.setattr("app.data_providers.custom.provider_has_dataset", lambda name, dataset: True)
+    monkeypatch.setattr("app.data_providers.custom.get_provider", lambda name: _Provider())
+    def _no_tickflow(*_args, **_kwargs):
+        raise AssertionError("不应回退 TickFlow")
+
+    monkeypatch.setattr(index_sync.kline_sync, "sync_daily_batch", _no_tickflow)
+    monkeypatch.setattr(index_sync, "compute_enriched", lambda raw, factors=None, instruments=None: raw)
+    monkeypatch.setattr(index_sync, "_load_etf_factors", lambda repo: pl.DataFrame())
+    repo = MagicMock()
+    capset = SimpleNamespace(has=lambda cap: False)
+
+    rows = index_sync.sync_and_persist_etf_daily(repo, capset, symbols_override=["510050.SH"])
+
+    assert rows == 1
+    assert seen["asset_type"] == "etf"
+    repo.append_etf_daily.assert_called_once()
+
+
+def test_etf_daily_falls_back_to_tickflow_when_custom_empty(monkeypatch):
+    from app.services import index_sync
+
+    class _Provider:
+        def get_daily(self, symbols, start_time, end_time, asset_type="stock", on_chunk_done=None):
+            return pl.DataFrame()
+
+    tickflow = pl.DataFrame({
+        "symbol": ["510050.SH"],
+        "date": [TODAY],
+        "open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0],
+        "volume": [1.0], "amount": [1.0],
+    })
+    monkeypatch.setattr(index_sync.preferences, "get_daily_data_provider", lambda: "fuyao")
+    monkeypatch.setattr(index_sync.preferences, "get_index_daily_batch_size", lambda: 100)
+    monkeypatch.setattr("app.data_providers.custom.provider_has_dataset", lambda name, dataset: True)
+    monkeypatch.setattr("app.data_providers.custom.get_provider", lambda name: _Provider())
+    monkeypatch.setattr(index_sync.kline_sync, "sync_daily_batch", lambda *a, **k: tickflow)
+    monkeypatch.setattr(index_sync, "compute_enriched", lambda raw, factors=None, instruments=None: raw)
+    monkeypatch.setattr(index_sync, "_load_etf_factors", lambda repo: pl.DataFrame())
+    monkeypatch.setattr(index_sync, "resolve_limit", lambda capset, cap: SimpleNamespace(batch=100, rpm=None))
+    monkeypatch.setattr(index_sync, "min_batch", lambda size, limit: size)
+    monkeypatch.setattr(index_sync, "sleep_between_batches", lambda *a, **k: None)
+    repo = MagicMock()
+    capset = SimpleNamespace(has=lambda cap: True)
+
+    rows = index_sync.sync_and_persist_etf_daily(repo, capset, symbols_override=["510050.SH"])
+
+    assert rows == 1
+    repo.append_etf_daily.assert_called_once()
